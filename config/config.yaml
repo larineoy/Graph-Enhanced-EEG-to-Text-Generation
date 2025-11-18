@@ -1,0 +1,76 @@
+# Configuration file for Graph-Enhanced EEG-to-Text Decoding
+
+# Dataset
+data:
+  data_dir: "ZuCo Data"
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  max_seq_length: 128
+  vocab_size: 10000
+  
+# Model parameters
+model:
+  # EEG parameters
+  num_channels: 64  # Number of EEG channels
+  num_frequency_bands: 5  # delta, theta, alpha, beta, gamma
+  time_steps: 1000
+  
+  # Graph parameters
+  strg:
+    alpha: 0.5  # Weight for spatial adjacency
+    beta: 0.5   # Weight for functional connectivity
+    use_spatial_topology: true
+    use_functional_connectivity: true
+    
+  # STRE parameters
+  stre:
+    node_dim: 128
+    graph_embed_dim: 256
+    num_gat_layers: 2
+    num_gat_heads: 4
+    gat_dropout: 0.1
+    
+    # Temporal Transformer
+    num_temporal_layers: 4
+    num_temporal_heads: 8
+    temporal_ff_dim: 512
+    temporal_dropout: 0.1
+    
+  # Decoder parameters
+  decoder:
+    vocab_size: 10000
+    embed_dim: 256
+    num_layers: 4
+    num_heads: 8
+    ff_dim: 512
+    dropout: 0.1
+    max_decoder_length: 128
+
+# Training
+training:
+  batch_size: 16
+  num_epochs: 50
+  learning_rate: 1e-4
+  weight_decay: 1e-5
+  warmup_steps: 1000
+  gradient_clip: 1.0
+  
+  # Loss weights
+  lambda_smooth: 0.1  # Graph smoothness regularization
+  lambda_contrastive: 0.2  # Contrastive alignment loss
+  
+  checkpoint_dir: "checkpoints"
+  save_every: 5
+  log_every: 100
+
+# Evaluation
+evaluation:
+  metrics: ["bleu", "rouge", "bertscore"]
+  beam_size: 5
+
+# Hardware
+device: "cuda"  # or "cpu"
+num_workers: 4
+seed: 42
+
