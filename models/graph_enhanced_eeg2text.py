@@ -1,10 +1,13 @@
 """
 Graph-Enhanced EEG-to-Text Decoding Model
 Main model that integrates STRG, STRE, and Transformer Decoder
+
+Uses preprocessed eeg_bands from preprocessing pipeline.
 """
 
 import torch
 import torch.nn as nn
+from typing import Dict, Optional
 from .strg import STRG
 from .stre import STRE
 from .decoder import TransformerDecoder
@@ -25,7 +28,7 @@ class GraphEnhancedEEG2Text(nn.Module):
         # EEG parameters
         num_channels: int = 64,
         num_frequency_bands: int = 5,
-        sampling_rate: float = 250.0,
+        sampling_rate: float = 250.0,  # Not used anymore but kept for compatibility
         
         # STRG parameters
         strg_alpha: float = 0.5,
@@ -34,7 +37,7 @@ class GraphEnhancedEEG2Text(nn.Module):
         use_functional_connectivity: bool = True,
         
         # STRE parameters
-        node_dim: int = 128,
+        node_dim: int = 1,  # Bandpower is scalar feature per node
         graph_embed_dim: int = 256,
         num_gat_layers: int = 2,
         num_gat_heads: int = 4,
@@ -106,49 +109,39 @@ class GraphEnhancedEEG2Text(nn.Module):
     
     def forward(
         self,
-        eeg_data: torch.Tensor,
-        tgt_tokens: torch.Tensor = None,
-        tgt_mask: torch.Tensor = None
+        eeg_bands: Dict[str, torch.Tensor],
+        tgt_tokens: Optional[torch.Tensor] = None,
+        tgt_mask: Optional[torch.Tensor] = None
     ):
         """
         Forward pass
         
         Args:
-            eeg_data: EEG signals (batch_size, num_channels, time_steps)
+            eeg_bands: Dictionary of frequency bands, each of shape (batch_size, num_channels, time_steps)
+                Keys: 'delta', 'theta', 'alpha', 'beta', 'gamma'
             tgt_tokens: Target text tokens for training (batch_size, tgt_len)
             tgt_mask: Causal mask for decoder (optional)
             
         Returns:
             If training (tgt_tokens provided):
-                logits: Decoder output logits (batch_size, tgt_len, vocab_size)
-                strg_output: STRG outputs (A, node_features, bandpowers) for loss computation
+                logits: Decoder output logits (batch_size, tgt_len-1, vocab_size)
+                strg_output: STRG outputs (A, node_features, bandpowers, stre_embeds) for loss computation
             If inference:
-                logits: Decoder output logits
+                memory: STRE embeddings (batch_size, 1, decoder_embed_dim)
+                strg_output: STRG outputs
         """
-        batch_size = eeg_data.shape[0]
+        # Step 1: Construct STRG from preprocessed frequency bands
+        A, node_features, bandpowers = self.strg(eeg_bands)
+        # A: (batch_size, num_nodes, num_nodes)
+        # node_features: (batch_size, num_nodes, node_dim) where node_dim=1
+        # bandpowers: (batch_size, num_channels, num_frequency_bands)
         
-        # Step 1: Construct STRG
-        # For each time window, we construct a graph
-        # Here we assume eeg_data is already windowed, or we need to window it
-        # For simplicity, we'll treat the entire sequence as one window
-        # In practice, you'd segment into windows first
-        
-        A, node_features, bandpowers = self.strg(eeg_data, self.sampling_rate)
-        
-        # Reshape for STRE: if we have multiple windows, reshape accordingly
-        # For now, assume single window per sample
-        num_nodes = A.shape[1]
-        num_windows = 1  # Can be extended for multiple windows
-        
+        # Reshape for STRE: treat as single temporal window
         A_windowed = A.unsqueeze(1)  # (batch_size, 1, num_nodes, num_nodes)
         node_features_windowed = node_features.unsqueeze(1)  # (batch_size, 1, num_nodes, node_dim)
         
         # Step 2: Generate STRE embeddings
-        stre_embeds = self.stre(A_windowed, node_features_windowed)  # (batch_size, num_windows, graph_embed_dim)
-        
-        # Average over windows if multiple
-        stre_embeds = stre_embeds.mean(dim=1)  # (batch_size, graph_embed_dim)
-        stre_embeds = stre_embeds.unsqueeze(1)  # (batch_size, 1, graph_embed_dim) - treat as sequence length 1
+        stre_embeds = self.stre(A_windowed, node_features_windowed)  # (batch_size, 1, graph_embed_dim)
         
         # Project to decoder dimension
         memory = self.stre_proj(stre_embeds)  # (batch_size, 1, decoder_embed_dim)
@@ -158,7 +151,7 @@ class GraphEnhancedEEG2Text(nn.Module):
             # Training mode
             # Shift tokens for teacher forcing
             tgt_input = tgt_tokens[:, :-1]  # Remove last token
-            tgt_output = tgt_tokens[:, 1:]  # Remove first token (BOS)
+            # tgt_output = tgt_tokens[:, 1:]  # For reference (targets in loss)
             
             # Generate causal mask
             if tgt_mask is None:
@@ -170,6 +163,7 @@ class GraphEnhancedEEG2Text(nn.Module):
                 memory=memory,
                 tgt_mask=tgt_mask
             )
+            # logits: (batch_size, tgt_len-1, vocab_size)
             
             return logits, {
                 'A': A,
@@ -178,8 +172,7 @@ class GraphEnhancedEEG2Text(nn.Module):
                 'stre_embeds': stre_embeds
             }
         else:
-            # Inference mode - will be handled separately with autoregressive generation
-            # For now, return memory for generation
+            # Inference mode - return memory for autoregressive generation
             return memory, {
                 'A': A,
                 'node_features': node_features,
@@ -189,7 +182,7 @@ class GraphEnhancedEEG2Text(nn.Module):
     
     def generate(
         self,
-        eeg_data: torch.Tensor,
+        eeg_bands: Dict[str, torch.Tensor],
         bos_token_id: int = 1,
         eos_token_id: int = 2,
         pad_token_id: int = 0,
@@ -197,25 +190,29 @@ class GraphEnhancedEEG2Text(nn.Module):
         beam_size: int = 5
     ):
         """
-        Generate text from EEG signals
+        Generate text from preprocessed EEG frequency bands
         
         Args:
-            eeg_data: EEG signals (batch_size, num_channels, time_steps)
+            eeg_bands: Dictionary of frequency bands, each of shape (batch_size, num_channels, time_steps)
+                Keys: 'delta', 'theta', 'alpha', 'beta', 'gamma'
             bos_token_id: Beginning of sequence token ID
             eos_token_id: End of sequence token ID
             pad_token_id: Padding token ID
             max_length: Maximum generation length
-            beam_size: Beam search size
+            beam_size: Beam search size (not used in greedy generation)
             
         Returns:
             generated_tokens: Generated token sequences (batch_size, seq_len)
         """
         self.eval()
-        batch_size = eeg_data.shape[0]
-        device = eeg_data.device
+        
+        # Get first band to determine batch size and device
+        first_band = list(eeg_bands.values())[0]
+        batch_size = first_band.shape[0]
+        device = first_band.device
         
         # Get STRE embeddings (memory)
-        memory, _ = self.forward(eeg_data)
+        memory, _ = self.forward(eeg_bands)
         
         # Simple greedy generation (can be extended to beam search)
         generated = torch.full(

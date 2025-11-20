@@ -2,14 +2,15 @@
 Spectro-Topographic Relational Graph (STRG) Construction
 Implements graph construction that jointly encodes spatial topology 
 and dynamic functional connectivity across electrodes and frequency bands.
+
+Uses preprocessed eeg_bands from preprocessing pipeline (no internal filtering).
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy import signal
 from scipy.stats import pearsonr
-from sklearn.preprocessing import StandardScaler
+from typing import Dict
 
 
 class STRG(nn.Module):
@@ -51,14 +52,8 @@ class STRG(nn.Module):
         self.use_functional_connectivity = use_functional_connectivity
         self.device = device
         
-        # Define frequency bands (Hz)
-        self.frequency_bands = {
-            'delta': (0.5, 4),
-            'theta': (4, 8),
-            'alpha': (8, 12),
-            'beta': (13, 30),
-            'gamma': (30, 100)
-        }
+        # Define frequency band names (must match preprocessing)
+        self.frequency_band_names = ['delta', 'theta', 'alpha', 'beta', 'gamma']
         
         # Build spatial adjacency matrix (10-20 system topology)
         self.register_buffer('A_spatial', self._build_spatial_adjacency())
@@ -93,157 +88,144 @@ class STRG(nn.Module):
         
         return A_spatial
     
-    def _extract_frequency_features(self, eeg_data: np.ndarray, sampling_rate: float = 250.0):
+    def _compute_bandpower(self, band_data: torch.Tensor) -> torch.Tensor:
         """
-        Extract frequency-specific features for each channel and frequency band.
+        Compute bandpower (variance) for each channel in a frequency band.
         
         Args:
-            eeg_data: EEG signal of shape (num_channels, time_steps)
-            sampling_rate: Sampling rate of EEG signal in Hz
+            band_data: Band-filtered EEG of shape (batch_size, num_channels, time_steps)
             
         Returns:
-            features: Dictionary of frequency band features, each of shape (num_channels, time_steps)
-            bandpowers: Band power features of shape (num_channels, num_frequency_bands)
+            bandpowers: Band power of shape (batch_size, num_channels)
         """
-        num_channels, time_steps = eeg_data.shape
-        features = {}
-        bandpowers = np.zeros((num_channels, self.num_frequency_bands))
-        
-        for band_idx, (band_name, (low_freq, high_freq)) in enumerate(self.frequency_bands.items()):
-            band_features = np.zeros((num_channels, time_steps))
-            
-            for ch in range(num_channels):
-                # Apply bandpass filter
-                nyquist = sampling_rate / 2
-                low = low_freq / nyquist
-                high = high_freq / nyquist
-                
-                try:
-                    b, a = signal.butter(4, [low, high], btype='band')
-                    filtered = signal.filtfilt(b, a, eeg_data[ch, :])
-                    band_features[ch, :] = filtered
-                    
-                    # Compute band power
-                    bandpowers[ch, band_idx] = np.var(filtered)
-                except:
-                    band_features[ch, :] = eeg_data[ch, :]
-                    bandpowers[ch, band_idx] = np.var(eeg_data[ch, :])
-            
-            features[band_name] = band_features
-        
-        return features, bandpowers
+        # Compute variance over time dimension
+        bandpowers = torch.var(band_data, dim=2, keepdim=False)
+        return bandpowers
     
-    def _compute_functional_connectivity(self, eeg_data: np.ndarray):
+    def _compute_functional_connectivity(self, band_data: torch.Tensor) -> torch.Tensor:
         """
         Compute dynamic functional connectivity using Pearson correlation.
         
         Args:
-            eeg_data: EEG signal of shape (num_channels, time_steps)
+            band_data: Band-filtered EEG of shape (num_channels, time_steps)
             
         Returns:
             A_functional: Functional connectivity matrix of shape (num_channels, num_channels)
         """
-        num_channels = eeg_data.shape[0]
-        A_functional = np.zeros((num_channels, num_channels))
+        num_channels, time_steps = band_data.shape
+        device = band_data.device
         
-        for i in range(num_channels):
-            for j in range(num_channels):
-                if i == j:
-                    A_functional[i, j] = 1.0
-                else:
-                    try:
-                        corr, _ = pearsonr(eeg_data[i, :], eeg_data[j, :])
-                        A_functional[i, j] = corr if not np.isnan(corr) else 0.0
-                    except:
-                        A_functional[i, j] = 0.0
+        # Normalize data (zero mean, unit variance per channel)
+        band_data_norm = (band_data - torch.mean(band_data, dim=1, keepdim=True)) / (
+            torch.std(band_data, dim=1, keepdim=True) + 1e-8
+        )
         
-        # Ensure symmetry and non-negative
+        # Compute correlation matrix: (num_channels, num_channels)
+        # Correlation = (X @ X^T) / (time_steps - 1) for normalized data
+        A_functional = torch.matmul(band_data_norm, band_data_norm.T) / (time_steps - 1)
+        
+        # Ensure diagonal is 1 and non-negative
+        A_functional = torch.abs(A_functional)
+        A_functional = A_functional - torch.diag(torch.diag(A_functional)) + torch.eye(num_channels, device=device)
+        
+        # Ensure symmetry
         A_functional = (A_functional + A_functional.T) / 2
-        A_functional = np.abs(A_functional)
         
         return A_functional
     
-    def forward(self, eeg_data: torch.Tensor, sampling_rate: float = 250.0):
+    def forward(self, eeg_bands: Dict[str, torch.Tensor]):
         """
-        Construct STRG from EEG data.
+        Construct STRG from preprocessed EEG frequency bands.
         
         Args:
-            eeg_data: EEG signal of shape (batch_size, num_channels, time_steps)
-            sampling_rate: Sampling rate in Hz
+            eeg_bands: Dictionary of frequency bands, each of shape (batch_size, num_channels, time_steps)
+                Keys: 'delta', 'theta', 'alpha', 'beta', 'gamma'
             
         Returns:
             A: Combined adjacency matrix of shape (batch_size, num_nodes, num_nodes)
                where num_nodes = num_channels * num_frequency_bands
             node_features: Node features of shape (batch_size, num_nodes, node_dim)
+               node_dim = 1 (bandpower feature)
             bandpowers: Band power features of shape (batch_size, num_channels, num_frequency_bands)
         """
-        batch_size = eeg_data.shape[0]
+        # Get batch size and check all bands have same shape
+        first_band = list(eeg_bands.values())[0]
+        batch_size, num_channels, time_steps = first_band.shape
+        
         num_nodes = self.num_channels * self.num_frequency_bands
+        device = first_band.device
         
-        # Convert to numpy for signal processing
-        eeg_np = eeg_data.cpu().numpy()
+        # Compute bandpowers for all bands and channels
+        bandpowers_list = []
+        for band_name in self.frequency_band_names:
+            if band_name not in eeg_bands:
+                raise ValueError(f"Missing frequency band: {band_name} in eeg_bands")
+            band_data = eeg_bands[band_name]  # (batch_size, C, T)
+            bandpowers_band = self._compute_bandpower(band_data)  # (batch_size, C)
+            bandpowers_list.append(bandpowers_band)
         
+        # Stack to get (batch_size, C, num_bands)
+        bandpowers = torch.stack(bandpowers_list, dim=2)  # (batch_size, C, num_bands)
+        
+        # Build node features: each node = (channel, frequency_band) pair
+        # Node order: (ch0, delta), (ch1, delta), ..., (chC, delta), (ch0, theta), ...
+        node_features_list = []
+        for b in range(batch_size):
+            node_feat_batch = []
+            for f_idx, band_name in enumerate(self.frequency_band_names):
+                for ch in range(self.num_channels):
+                    # Node feature = bandpower for this (channel, band) pair
+                    bandpower_val = bandpowers[b, ch, f_idx]
+                    node_feat_batch.append(bandpower_val)
+            
+            node_features_list.append(torch.stack(node_feat_batch))  # (num_nodes,)
+        
+        # Stack to (batch_size, num_nodes, 1)
+        node_features = torch.stack(node_features_list).unsqueeze(-1)  # (batch_size, num_nodes, 1)
+        
+        # Build adjacency matrices
         batch_A = []
-        batch_node_features = []
-        batch_bandpowers = []
         
         for b in range(batch_size):
-            # Extract frequency features
-            freq_features, bandpowers = self._extract_frequency_features(
-                eeg_np[b], sampling_rate
-            )
-            batch_bandpowers.append(bandpowers)
-            
-            # Build node features: each node is (channel, frequency_band) pair
-            node_features = np.zeros((num_nodes, 1))
-            for f in range(self.num_frequency_bands):
-                for ch in range(self.num_channels):
-                    node_idx = f * self.num_channels + ch
-                    node_features[node_idx, 0] = bandpowers[ch, f]
-            
-            # Compute functional connectivity for each frequency band
-            A_functional_full = np.zeros((num_nodes, num_nodes))
+            # Initialize functional connectivity matrix
+            A_functional_full = torch.zeros(num_nodes, num_nodes, device=device)
             
             if self.use_functional_connectivity:
-                for f in range(self.num_frequency_bands):
-                    band_name = list(self.frequency_bands.keys())[f]
-                    band_data = freq_features[band_name]
+                # Compute functional connectivity for each frequency band
+                for f_idx, band_name in enumerate(self.frequency_band_names):
+                    band_data = eeg_bands[band_name][b]  # (C, T) for this batch item
                     
                     # Compute functional connectivity for this band
-                    A_func_band = self._compute_functional_connectivity(band_data)
+                    A_func_band = self._compute_functional_connectivity(band_data)  # (C, C)
                     
-                    # Place in full matrix
-                    base_idx = f * self.num_channels
+                    # Place in full matrix at correct position
+                    base_idx = f_idx * self.num_channels
                     A_functional_full[
                         base_idx:base_idx + self.num_channels,
                         base_idx:base_idx + self.num_channels
                     ] = A_func_band
             
             # Combine spatial and functional adjacency
-            A_spatial_np = self.A_spatial.cpu().numpy()
-            
             if self.use_spatial_topology and self.use_functional_connectivity:
-                A = self.alpha * A_spatial_np + self.beta * A_functional_full
+                A = self.alpha * self.A_spatial + self.beta * A_functional_full
             elif self.use_spatial_topology:
-                A = A_spatial_np
+                A = self.A_spatial
             elif self.use_functional_connectivity:
                 A = A_functional_full
             else:
-                A = np.eye(num_nodes)
+                A = torch.eye(num_nodes, device=device)
             
-            # Normalize adjacency matrix
-            D = np.sum(A, axis=1)
-            D_inv_sqrt = np.power(D + 1e-8, -0.5)
-            D_inv_sqrt = np.where(np.isinf(D_inv_sqrt), 0, D_inv_sqrt)
-            A_normalized = np.diag(D_inv_sqrt) @ A @ np.diag(D_inv_sqrt)
+            # Normalize adjacency matrix (symmetric normalization)
+            D = torch.sum(A, dim=1)  # (num_nodes,)
+            D_inv_sqrt = torch.pow(D + 1e-8, -0.5)
+            D_inv_sqrt = torch.where(torch.isinf(D_inv_sqrt), torch.zeros_like(D_inv_sqrt), D_inv_sqrt)
+            D_inv_sqrt = torch.diag(D_inv_sqrt)
+            A_normalized = D_inv_sqrt @ A @ D_inv_sqrt
             
             batch_A.append(A_normalized)
-            batch_node_features.append(node_features)
         
-        # Convert to tensors
-        A = torch.FloatTensor(np.stack(batch_A)).to(self.device)
-        node_features = torch.FloatTensor(np.stack(batch_node_features)).to(self.device)
-        bandpowers = torch.FloatTensor(np.stack(batch_bandpowers)).to(self.device)
+        # Stack adjacency matrices
+        A = torch.stack(batch_A)  # (batch_size, num_nodes, num_nodes)
         
         return A, node_features, bandpowers
 
