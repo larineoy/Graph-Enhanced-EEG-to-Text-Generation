@@ -14,6 +14,7 @@ from tqdm import tqdm
 from models import GraphEnhancedEEG2Text
 from preprocessing.preprocessing import ZuCoDataset, collate_fn
 from utils.metrics import evaluate_predictions
+from utils.statistics import compute_statistics, format_metric_with_std
 from train import load_config, create_model, set_seed
 
 
@@ -61,7 +62,7 @@ def main():
     parser.add_argument('--config', type=str, default='config/config.yaml',
                        help='Path to config file')
     parser.add_argument('--checkpoint', type=str, required=True,
-                       help='Path to model checkpoint')
+                       help='Path to model checkpoint or directory with multiple checkpoints')
     parser.add_argument('--data_dir', type=str, default='ZuCo Data',
                        help='Path to data directory')
     parser.add_argument('--split', type=str, default='test',
@@ -69,6 +70,10 @@ def main():
                        help='Dataset split to evaluate on')
     parser.add_argument('--output', type=str, default='evaluation_results.json',
                        help='Path to save evaluation results')
+    parser.add_argument('--multi_seed', action='store_true',
+                       help='Evaluate multiple checkpoints (seed_1, seed_2, etc.) and compute statistics')
+    parser.add_argument('--num_seeds', type=int, default=5,
+                       help='Number of seeds to evaluate (if multi_seed)')
     
     args = parser.parse_args()
     
@@ -111,31 +116,99 @@ def main():
         num_workers=config['num_workers']
     )
     
-    # Load model
-    model = create_model(config, device)
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(device)
+    if args.multi_seed:
+        # Multi-seed evaluation mode
+        checkpoint_dir = os.path.dirname(args.checkpoint) if os.path.isfile(args.checkpoint) else args.checkpoint
+        all_results = []
+        
+        print(f'\n{"="*60}')
+        print(f'Multi-Seed Evaluation: {args.num_seeds} seeds')
+        print(f'{"="*60}\n')
+        
+        for seed in range(1, args.num_seeds + 1):
+            # Step 1: Find checkpoint for this seed (Line ~XXX)
+            checkpoint_path = os.path.join(checkpoint_dir, f'seed_{seed}', 'best_model.pt')
+            if not os.path.exists(checkpoint_path):
+                checkpoint_path = os.path.join(checkpoint_dir, f'seed_{seed}', 'checkpoint.pt')
+            if not os.path.exists(checkpoint_path):
+                print(f"Warning: Checkpoint not found for seed {seed}: {checkpoint_path}")
+                continue
+            
+            print(f'Evaluating seed {seed}/{args.num_seeds}...')
+            
+            # Step 2: Load model for this seed (Line ~XXX)
+            model = create_model(config, device)
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            model = model.to(device)
+            model.eval()
+            
+            # Step 3: Evaluate model on test set (Line ~XXX)
+            metrics = evaluate(model, dataloader, device, tokenizer, config)
+            all_results.append(metrics)
+            
+            # Step 4: Save per-seed results (Line ~XXX)
+            seed_output = os.path.join(checkpoint_dir, f'eval_{args.split}_seed_{seed}.json')
+            with open(seed_output, 'w') as f:
+                json.dump(metrics, f, indent=2)
+            print(f'  Saved results to {seed_output}')
+        
+        # Step 5: Compute statistics across seeds (Line ~XXX)
+        if len(all_results) > 0:
+            statistics = compute_statistics(all_results)
+            
+            print(f'\n{"="*60}')
+            print(f'Multi-Seed Evaluation Results ({len(all_results)} runs):')
+            print(f'{"="*60}')
+            for metric, stats in statistics.items():
+                if 'mean' in stats:
+                    print(f'{metric:<25} {format_metric_with_std(stats["mean"], stats["std"])}')
+            print(f'{"="*60}')
+            
+            # Step 6: Save aggregated results (Line ~XXX)
+            if args.output:
+                output_path = args.output
+            else:
+                output_path = os.path.join(checkpoint_dir, f'eval_{args.split}_multi_seed.json')
+            
+            with open(output_path, 'w') as f:
+                json.dump({
+                    'statistics': statistics,
+                    'all_results': all_results,
+                    'num_seeds': len(all_results)
+                }, f, indent=2)
+            
+            print(f'\nAggregated results saved to {output_path}')
+        else:
+            print('No valid checkpoints found for multi-seed evaluation')
     
-    print(f'Loaded model from {args.checkpoint}')
-    print(f'Evaluating on {args.split} split ({len(dataset)} samples)')
-    
-    # Evaluate
-    metrics = evaluate(model, dataloader, device, tokenizer, config)
-    
-    # Print results
-    print('\nEvaluation Results:')
-    print('=' * 50)
-    print(f"{'Metric':<20} {'Score':<10}")
-    print('=' * 50)
-    for metric, score in sorted(metrics.items()):
-        print(f"{metric:<20} {score:>8.2f}")
-    print('=' * 50)
-    
-    # Save results
-    with open(args.output, 'w') as f:
-        json.dump(metrics, f, indent=2)
-    print(f'\nResults saved to {args.output}')
+    else:
+        # Single checkpoint evaluation mode (original code)
+        # Load model
+        model = create_model(config, device)
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model = model.to(device)
+        
+        print(f'Loaded model from {args.checkpoint}')
+        print(f'Evaluating on {args.split} split ({len(dataset)} samples)')
+        
+        # Evaluate
+        metrics = evaluate(model, dataloader, device, tokenizer, config)
+        
+        # Print results
+        print('\nEvaluation Results:')
+        print('=' * 50)
+        print(f"{'Metric':<20} {'Score':<10}")
+        print('=' * 50)
+        for metric, score in sorted(metrics.items()):
+            print(f"{metric:<20} {score:>8.2f}")
+        print('=' * 50)
+        
+        # Save results
+        with open(args.output, 'w') as f:
+            json.dump(metrics, f, indent=2)
+        print(f'\nResults saved to {args.output}')
 
 
 if __name__ == '__main__':
