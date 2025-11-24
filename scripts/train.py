@@ -199,22 +199,38 @@ def main():
     
     args = parser.parse_args()
     
+    print("="*70)
+    print("GRAPH-ENHANCED EEG-TO-TEXT TRAINING")
+    print("="*70)
+    print("\n[STAGE 1/7] Loading configuration...")
+    
     # Load config
     config = load_config(args.config)
     set_seed(config['seed'])
+    print(f"  ✓ Config loaded from {args.config}")
+    print(f"  ✓ Random seed set to {config['seed']}")
     
+    print("\n[STAGE 2/7] Setting up device...")
     # Setup device
     device = torch.device(config['device'] if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
+    print(f"  ✓ Using device: {device}")
+    if torch.cuda.is_available():
+        print(f"  ✓ GPU: {torch.cuda.get_device_name(0)}")
+        print(f"  ✓ CUDA version: {torch.version.cuda}")
     
+    print("\n[STAGE 3/7] Initializing tokenizer...")
     # Create tokenizer
     try:
         tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        print("  ✓ BERT tokenizer loaded successfully")
     except:
-        print("Warning: Could not load tokenizer, using simple tokenizer")
+        print("  ⚠ Warning: Could not load tokenizer, using simple tokenizer")
         tokenizer = None
+    
+    print("\n[STAGE 4/7] Loading and preprocessing datasets...")
+    print("  This may take a few minutes (loading EEG files, applying filters, extracting frequency bands)...")
     
     # Create datasets with artifact removal settings from config
     data_config = config['data']
@@ -241,6 +257,10 @@ def main():
         bad_channel_threshold=data_config.get('bad_channel_threshold', 3.0)
     )
     
+    print(f"  ✓ Train dataset: {len(train_dataset)} samples")
+    print(f"  ✓ Validation dataset: {len(val_dataset)} samples")
+    
+    print("\n[STAGE 5/7] Creating data loaders...")
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['training']['batch_size'],
@@ -256,10 +276,20 @@ def main():
         collate_fn=lambda x: collate_fn(x, tokenizer, config['data']['max_seq_length']),
         num_workers=config['num_workers']
     )
+    print(f"  ✓ Train batches: {len(train_loader)}")
+    print(f"  ✓ Validation batches: {len(val_loader)}")
     
+    print("\n[STAGE 6/7] Initializing model...")
     # Create model
     model = create_model(config, device)
     model = model.to(device)
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  ✓ Model created and moved to {device}")
+    print(f"  ✓ Total parameters: {total_params:,}")
+    print(f"  ✓ Trainable parameters: {trainable_params:,}")
     
     # Create optimizer
     optimizer = optim.AdamW(
@@ -267,6 +297,7 @@ def main():
         lr=config['training']['learning_rate'],
         weight_decay=config['training']['weight_decay']
     )
+    print(f"  ✓ Optimizer: AdamW (lr={config['training']['learning_rate']})")
     
     # Create loss function
     criterion = CompositeLoss(
@@ -274,25 +305,33 @@ def main():
         lambda_contrastive=config['training']['lambda_contrastive'],
         vocab_size=config['model']['decoder']['vocab_size']
     )
+    print(f"  ✓ Loss function: Composite (λ_smooth={config['training']['lambda_smooth']}, λ_contrastive={config['training']['lambda_contrastive']})")
     
     # Resume from checkpoint if provided
     start_epoch = 0
     best_val_loss = float('inf')
     
     if args.resume:
+        print(f"  ✓ Resuming from checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        print(f"Resumed from epoch {start_epoch}")
+        print(f"  ✓ Resumed from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
+    else:
+        print("  ✓ Starting training from scratch")
     
     # Create checkpoint directory
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    print(f"  ✓ Checkpoint directory: {args.checkpoint_dir}")
     
     # Create visualization directory
     viz_dir = os.path.join(args.checkpoint_dir, 'visualizations')
     os.makedirs(viz_dir, exist_ok=True)
+    
+    print("\n[STAGE 7/7] Starting training loop...")
+    print("="*70)
     
     # Training loop
     training_log = []
@@ -382,8 +421,21 @@ def main():
     log_path = os.path.join(args.checkpoint_dir, 'training_log.json')
     with open(log_path, 'w') as f:
         json.dump(training_log, f, indent=2)
-    print(f'\nTraining log saved to {log_path}')
-    print('Training completed!')
+    
+    print("\n" + "="*70)
+    print("TRAINING COMPLETED!")
+    print("="*70)
+    print(f"  ✓ Training log saved to: {log_path}")
+    print(f"  ✓ Best model saved to: {os.path.join(args.checkpoint_dir, 'best_model.pt')}")
+    print(f"  ✓ Total epochs trained: {len(training_log)}")
+    print(f"  ✓ Best validation loss: {best_val_loss:.4f}")
+    if len(training_log) > 0:
+        final_metrics = training_log[-1].get('val_metrics', {})
+        if final_metrics:
+            print(f"  ✓ Final validation metrics:")
+            for metric, value in final_metrics.items():
+                print(f"      - {metric}: {value:.4f}")
+    print("="*70)
 
 
 if __name__ == '__main__':
