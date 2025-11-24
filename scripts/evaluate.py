@@ -15,6 +15,10 @@ from models import GraphEnhancedEEG2Text
 from preprocessing.preprocessing import ZuCoDataset, collate_fn
 from utils.metrics import evaluate_predictions
 from utils.statistics import compute_statistics, format_metric_with_std
+import sys
+import os
+# Add scripts directory to path to import from train
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from train import load_config, create_model, set_seed
 
 
@@ -77,23 +81,34 @@ def main():
     
     args = parser.parse_args()
     
+    print("="*70)
+    print("GRAPH-ENHANCED EEG-TO-TEXT EVALUATION")
+    print("="*70)
+    print("\n[STAGE 1/6] Loading configuration...")
+    
     # Load config
     config = load_config(args.config)
     set_seed(config['seed'])
+    print(f"  ✓ Config loaded from {args.config}")
     
+    print("\n[STAGE 2/6] Setting up device...")
     # Setup device
     device = torch.device(config['device'] if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
+    print(f"  ✓ Using device: {device}")
     
+    print("\n[STAGE 3/6] Initializing tokenizer...")
     # Create tokenizer
     try:
         tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        print("  ✓ BERT tokenizer loaded successfully")
     except:
-        print("Warning: Could not load tokenizer, using simple tokenizer")
+        print("  ⚠ Warning: Could not load tokenizer, using simple tokenizer")
         tokenizer = None
     
+    print(f"\n[STAGE 4/6] Loading {args.split} dataset...")
+    print("  This may take a few minutes...")
     # Create dataset with artifact removal settings from config
     data_config = config['data']
     dataset = ZuCoDataset(
@@ -108,6 +123,8 @@ def main():
         bad_channel_threshold=data_config.get('bad_channel_threshold', 3.0)
     )
     
+    print(f"  ✓ Loaded {len(dataset)} samples")
+    
     dataloader = DataLoader(
         dataset,
         batch_size=config['training']['batch_size'],
@@ -115,7 +132,9 @@ def main():
         collate_fn=lambda x: collate_fn(x, tokenizer, config['data']['max_seq_length']),
         num_workers=config['num_workers']
     )
+    print(f"  ✓ Created data loader with {len(dataloader)} batches")
     
+    print("\n[STAGE 5/6] Loading model checkpoint(s)...")
     if args.multi_seed:
         # Multi-seed evaluation mode
         checkpoint_dir = os.path.dirname(args.checkpoint) if os.path.isfile(args.checkpoint) else args.checkpoint
@@ -185,30 +204,40 @@ def main():
     else:
         # Single checkpoint evaluation mode (original code)
         # Load model
+        print(f"  ✓ Loading checkpoint: {args.checkpoint}")
         model = create_model(config, device)
         checkpoint = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         model = model.to(device)
+        model.eval()
         
-        print(f'Loaded model from {args.checkpoint}')
-        print(f'Evaluating on {args.split} split ({len(dataset)} samples)')
+        if 'epoch' in checkpoint:
+            print(f"  ✓ Model from epoch {checkpoint['epoch'] + 1}")
+        if 'best_val_loss' in checkpoint:
+            print(f"  ✓ Best validation loss: {checkpoint['best_val_loss']:.4f}")
+        
+        print(f"\n[STAGE 6/6] Running evaluation on {args.split} split...")
+        print(f"  Dataset: {len(dataset)} samples, {len(dataloader)} batches")
+        print("  Generating predictions and computing metrics...")
         
         # Evaluate
         metrics = evaluate(model, dataloader, device, tokenizer, config)
         
         # Print results
-        print('\nEvaluation Results:')
-        print('=' * 50)
-        print(f"{'Metric':<20} {'Score':<10}")
-        print('=' * 50)
+        print("\n" + "="*70)
+        print("EVALUATION RESULTS")
+        print("="*70)
+        print(f"{'Metric':<30} {'Score':<15}")
+        print("-"*70)
         for metric, score in sorted(metrics.items()):
-            print(f"{metric:<20} {score:>8.2f}")
-        print('=' * 50)
+            print(f"{metric:<30} {score:>15.4f}")
+        print("="*70)
         
         # Save results
         with open(args.output, 'w') as f:
             json.dump(metrics, f, indent=2)
-        print(f'\nResults saved to {args.output}')
+        print(f"\n  ✓ Results saved to: {args.output}")
+        print("="*70)
 
 
 if __name__ == '__main__':
