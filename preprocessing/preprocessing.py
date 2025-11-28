@@ -15,6 +15,8 @@ import os
 import re
 import glob
 import h5py
+from tqdm import tqdm
+import time
 
 
 class ZuCoDataset(Dataset):
@@ -87,14 +89,17 @@ class ZuCoDataset(Dataset):
                 raise ValueError(f"Could not detect ZuCo version in {data_dir}")
         self.version = version
         
-        # Load all aligned samples
+        # Load all aligned samples with progress tracking
+        print(f"  Loading EEG files and aligning with text (this may take 2-10 minutes)...")
+        start_time = time.time()
         self.samples = self._load_aligned_samples()
+        load_time = time.time() - start_time
         
         # Split data if not 'all'
         if split != 'all':
             self.samples = self._split_data(self.samples)
         
-        print(f"Loaded {len(self.samples)} samples from ZuCo {version} ({split} split)")
+        print(f"  ✓ Loaded {len(self.samples)} samples from ZuCo {version} ({split} split) in {load_time:.1f} seconds")
     
     def _load_aligned_samples(self) -> List[Dict]:
         """
@@ -119,6 +124,7 @@ class ZuCoDataset(Dataset):
         eeg_base = os.path.join(base_path, 'eeg')
         text_base = os.path.join(base_path, 'text')
         
+        print(f"    Loading text sentences...")
         # Load text data
         text_data = {}
         
@@ -149,35 +155,20 @@ class ZuCoDataset(Dataset):
                         elif isinstance(sent, np.ndarray) and sent.size > 0:
                             text_data[f'SR_{i+1}'] = str(sent.item())
         
-        # Process NR task
+        print(f"    ✓ Loaded {len(text_data)} text sentences")
+        
+        # Collect all subjects and files for progress tracking
+        all_tasks = []
         nr_path = os.path.join(eeg_base, 'NR')
         if os.path.exists(nr_path):
             for subject_dir in os.listdir(nr_path):
                 subject_path = os.path.join(nr_path, subject_dir)
                 if os.path.isdir(subject_path):
-                    # Find EEG files
                     eeg_files = glob.glob(os.path.join(subject_path, '*_NR*_EEG.mat'))
                     wordbounds_files = glob.glob(os.path.join(subject_path, 'wordbounds*.mat'))
-                    
-                    # Load wordbounds
-                    wordbounds = self._load_wordbounds(wordbounds_files)
-                    
-                    # Process each EEG file
                     for eeg_file in eeg_files:
-                        # Extract task number (e.g., NR1 from gip_ZAB_NR1_EEG.mat)
-                        match = re.search(r'NR(\d+)', eeg_file)
-                        if match:
-                            task_num = int(match.group(1))
-                            task_key = f'NR_{task_num}'
-                            
-                            if task_key in text_data:
-                                eeg_samples = self._load_eeg_with_alignment(
-                                    eeg_file, wordbounds, text_data[task_key], 
-                                    task_key, subject_dir, 'NR'
-                                )
-                                samples.extend(eeg_samples)
+                        all_tasks.append(('NR', subject_dir, eeg_file, wordbounds_files))
         
-        # Process SR task (similar structure)
         sr_path = os.path.join(eeg_base, 'SR')
         if os.path.exists(sr_path):
             for subject_dir in os.listdir(sr_path):
@@ -185,22 +176,49 @@ class ZuCoDataset(Dataset):
                 if os.path.isdir(subject_path):
                     eeg_files = glob.glob(os.path.join(subject_path, '*_SR*_EEG.mat'))
                     wordbounds_files = glob.glob(os.path.join(subject_path, 'wordbounds*.mat'))
-                    
-                    wordbounds = self._load_wordbounds(wordbounds_files)
-                    
                     for eeg_file in eeg_files:
-                        match = re.search(r'SR(\d+)', eeg_file)
-                        if match:
-                            task_num = int(match.group(1))
-                            task_key = f'SR_{task_num}'
-                            
-                            if task_key in text_data:
-                                eeg_samples = self._load_eeg_with_alignment(
-                                    eeg_file, wordbounds, text_data[task_key],
-                                    task_key, subject_dir, 'SR'
-                                )
-                                samples.extend(eeg_samples)
+                        all_tasks.append(('SR', subject_dir, eeg_file, wordbounds_files))
         
+        print(f"    Processing {len(all_tasks)} EEG files across {len(set(t[1] for t in all_tasks))} subjects...")
+        
+        # Load wordbounds per subject (cache to avoid reloading)
+        wordbounds_cache = {}
+        
+        # Process all tasks with progress bar
+        for task_type, subject_dir, eeg_file, wordbounds_files in tqdm(all_tasks, desc="      Loading EEG files", unit="file", leave=False):
+            # Load wordbounds (cache by subject)
+            if subject_dir not in wordbounds_cache:
+                wordbounds_cache[subject_dir] = self._load_wordbounds(wordbounds_files)
+            wordbounds = wordbounds_cache[subject_dir]
+            
+            # Process EEG file
+            if task_type == 'NR':
+                match = re.search(r'NR(\d+)', eeg_file)
+                if match:
+                    task_num = int(match.group(1))
+                    task_key = f'NR_{task_num}'
+                    
+                    if task_key in text_data:
+                        eeg_samples = self._load_eeg_with_alignment(
+                            eeg_file, wordbounds, text_data[task_key], 
+                            task_key, subject_dir, 'NR'
+                        )
+                        samples.extend(eeg_samples)
+            
+            elif task_type == 'SR':
+                match = re.search(r'SR(\d+)', eeg_file)
+                if match:
+                    task_num = int(match.group(1))
+                    task_key = f'SR_{task_num}'
+                    
+                    if task_key in text_data:
+                        eeg_samples = self._load_eeg_with_alignment(
+                            eeg_file, wordbounds, text_data[task_key],
+                            task_key, subject_dir, 'SR'
+                        )
+                        samples.extend(eeg_samples)
+        
+        print(f"    ✓ Processed {len(all_tasks)} files, extracted {len(samples)} aligned samples")
         return samples
     
     def _load_zuco_v2_samples(self, base_path: str) -> List[Dict]:
@@ -209,10 +227,11 @@ class ZuCoDataset(Dataset):
         eeg_base = os.path.join(base_path, 'eeg')
         text_base = os.path.join(base_path, 'text')
         
+        print(f"    Loading text sentences from CSV files...")
         # Load text data from CSV files
         text_data = {}
         csv_files = glob.glob(os.path.join(text_base, 'nr_*.csv'))
-        for csv_file in csv_files:
+        for csv_file in tqdm(csv_files, desc="      Loading CSV files", unit="file", leave=False):
             # Extract task number from filename (e.g., nr_1.csv -> 1)
             match = re.search(r'nr_(\d+)', csv_file)
             if match:
@@ -220,36 +239,47 @@ class ZuCoDataset(Dataset):
                 sentences = self._load_sentences_from_csv(csv_file)
                 text_data[task_num] = sentences
         
+        print(f"    ✓ Loaded text data for {len(text_data)} tasks")
+        
         # Load wordbounds files
+        print(f"    Loading wordbounds...")
         wordbounds_base = os.path.join(eeg_base, 'NR')
         wordbounds_files = glob.glob(os.path.join(wordbounds_base, 'wordbounds_NR*.mat'))
         wordbounds = self._load_wordbounds(wordbounds_files)
+        print(f"    ✓ Loaded wordbounds")
         
-        # Process NR task
+        # Collect all EEG files for progress tracking
+        all_tasks = []
         nr_path = os.path.join(eeg_base, 'NR')
         if os.path.exists(nr_path):
             for subject_dir in os.listdir(nr_path):
                 subject_path = os.path.join(nr_path, subject_dir)
                 if os.path.isdir(subject_path):
                     eeg_files = glob.glob(os.path.join(subject_path, '*_NR*_EEG.mat'))
-                    
                     for eeg_file in eeg_files:
-                        # Extract task number (e.g., NR3 from gip_YAC_NR3_EEG.mat)
-                        match = re.search(r'NR(\d+)', eeg_file)
-                        if match:
-                            task_num = int(match.group(1))
-                            
-                            if task_num in text_data:
-                                # Get sentences for this task
-                                sentences = text_data[task_num]
-                                
-                                # Load EEG and align with sentences
-                                eeg_samples = self._load_eeg_with_sentence_alignment(
-                                    eeg_file, wordbounds, sentences,
-                                    task_num, subject_dir, 'NR'
-                                )
-                                samples.extend(eeg_samples)
+                        all_tasks.append((subject_dir, eeg_file))
         
+        print(f"    Processing {len(all_tasks)} EEG files across {len(set(t[0] for t in all_tasks))} subjects...")
+        
+        # Process NR task with progress bar
+        for subject_dir, eeg_file in tqdm(all_tasks, desc="      Loading EEG files", unit="file", leave=False):
+            # Extract task number (e.g., NR3 from gip_YAC_NR3_EEG.mat)
+            match = re.search(r'NR(\d+)', eeg_file)
+            if match:
+                task_num = int(match.group(1))
+                
+                if task_num in text_data:
+                    # Get sentences for this task
+                    sentences = text_data[task_num]
+                    
+                    # Load EEG and align with sentences
+                    eeg_samples = self._load_eeg_with_sentence_alignment(
+                        eeg_file, wordbounds, sentences,
+                        task_num, subject_dir, 'NR'
+                    )
+                    samples.extend(eeg_samples)
+        
+        print(f"    ✓ Processed {len(all_tasks)} files, extracted {len(samples)} aligned samples")
         return samples
     
     def _load_sentences_from_csv(self, csv_file: str) -> List[str]:
@@ -296,6 +326,12 @@ class ZuCoDataset(Dataset):
             # Try scipy first (for older MATLAB formats)
             try:
                 data = scipy.io.loadmat(filepath)
+                # Convert float64 arrays to float32 to save memory
+                for key, value in data.items():
+                    if isinstance(value, np.ndarray) and value.dtype == np.float64:
+                        # Only convert large arrays to save memory
+                        if value.size > 10000:  # Threshold: ~80KB for 10000 floats
+                            data[key] = value.astype(np.float32)
                 return data
             except (NotImplementedError, ValueError) as e:
                 # If scipy fails, try h5py for MATLAB v7.3 files
@@ -327,28 +363,30 @@ class ZuCoDataset(Dataset):
                     if 'data' in eeg_group.keys():
                         # Get the data reference
                         data_ref = eeg_group['data']
-                        if isinstance(data_ref, h5py.Dataset):
-                            # If it's a reference, follow it
-                            try:
-                                if data_ref.dtype == h5py.special_dtype(ref=h5py.Reference):
-                                    ref_path = data_ref[0, 0] if data_ref.ndim >= 2 else data_ref[0]
-                                    actual_data = f[ref_path]
-                                    data_arr = np.array(actual_data)
-                                    # MATLAB stores data transposed in v7.3
-                                    if data_arr.ndim == 2:
-                                        data_arr = data_arr.T
-                                    data['data'] = data_arr
-                                    data['EEG'] = {'data': data_arr}
-                            except:
-                                # If reference doesn't work, try direct access
-                                try:
-                                    data_arr = np.array(data_ref)
-                                    if data_arr.ndim == 2:
-                                        data_arr = data_arr.T
-                                    data['data'] = data_arr
-                                    data['EEG'] = {'data': data_arr}
-                                except:
-                                    pass
+                                    if isinstance(data_ref, h5py.Dataset):
+                                        # If it's a reference, follow it
+                                        try:
+                                            if data_ref.dtype == h5py.special_dtype(ref=h5py.Reference):
+                                                ref_path = data_ref[0, 0] if data_ref.ndim >= 2 else data_ref[0]
+                                                actual_data = f[ref_path]
+                                                # Convert to float32 immediately to save memory (50% reduction)
+                                                data_arr = np.array(actual_data, dtype=np.float32) if actual_data.dtype.kind == 'f' else np.array(actual_data)
+                                                # MATLAB stores data transposed in v7.3
+                                                if data_arr.ndim == 2:
+                                                    data_arr = data_arr.T
+                                                data['data'] = data_arr
+                                                data['EEG'] = {'data': data_arr}
+                                        except Exception as e:
+                                            # If reference doesn't work, try direct access
+                                            try:
+                                                # Convert to float32 immediately to save memory
+                                                data_arr = np.array(data_ref, dtype=np.float32) if data_ref.dtype.kind == 'f' else np.array(data_ref)
+                                                if data_arr.ndim == 2:
+                                                    data_arr = data_arr.T
+                                                data['data'] = data_arr
+                                                data['EEG'] = {'data': data_arr}
+                                            except Exception as e2:
+                                                pass
                 
                 # Also try to find any large numeric datasets
                 def extract_data(name, obj):
@@ -361,15 +399,18 @@ class ZuCoDataset(Dataset):
                             
                             # Try to get actual numeric data
                             try:
-                                arr = np.array(obj)
-                                # Only store if it's numeric and reasonably sized
-                                if arr.dtype.kind in ['f', 'i', 'u'] and arr.size > 100:
-                                    # MATLAB stores data transposed in v7.3
-                                    if arr.ndim == 2 and arr.shape[0] < arr.shape[1]:
-                                        arr = arr.T
-                                    key = name.split('/')[-1]
-                                    if key not in data or arr.size > data[key].size:
-                                        data[key] = arr
+                                # Check shape first without loading full array
+                                if obj.shape and obj.size > 100:
+                                    # Load and convert to float32 immediately to save memory (50% reduction)
+                                    arr = np.array(obj, dtype=np.float32) if obj.dtype.kind == 'f' else np.array(obj)
+                                    # Only store if it's numeric and reasonably sized
+                                    if arr.dtype.kind in ['f', 'i', 'u']:
+                                        # MATLAB stores data transposed in v7.3
+                                        if arr.ndim == 2 and arr.shape[0] < arr.shape[1]:
+                                            arr = arr.T
+                                        key = name.split('/')[-1]
+                                        if key not in data or arr.size > data[key].size:
+                                            data[key] = arr
                             except:
                                 pass
                     except:
@@ -419,6 +460,10 @@ class ZuCoDataset(Dataset):
                     else:
                         eeg = np.array(eeg)
                     
+                    # Convert to float32 to save memory if still float64
+                    if eeg.dtype == np.float64:
+                        eeg = eeg.astype(np.float32)
+                    
                     # Ensure shape is (channels, time)
                     if eeg.ndim == 2:
                         if eeg.shape[0] < eeg.shape[1]:
@@ -427,6 +472,9 @@ class ZuCoDataset(Dataset):
                     elif eeg.ndim == 3:
                         # (trials, channels, time) -> average or take first trial
                         eeg = eeg[0] if eeg.shape[0] == 1 else np.mean(eeg, axis=0)
+                        # Convert to float32 if needed
+                        if eeg.dtype == np.float64:
+                            eeg = eeg.astype(np.float32)
                         return eeg
         
         # Try to find largest numeric array
@@ -444,6 +492,10 @@ class ZuCoDataset(Dataset):
                         best_eeg = arr
         
         if best_eeg is not None:
+            # Convert to float32 to save memory if still float64
+            if best_eeg.dtype == np.float64:
+                best_eeg = best_eeg.astype(np.float32)
+            
             # Ensure shape is (channels, time)
             if best_eeg.ndim == 2:
                 if best_eeg.shape[0] < best_eeg.shape[1]:
@@ -451,6 +503,9 @@ class ZuCoDataset(Dataset):
                 return best_eeg
             elif best_eeg.ndim == 3:
                 best_eeg = best_eeg[0] if best_eeg.shape[0] == 1 else np.mean(best_eeg, axis=0)
+                # Convert to float32 if needed
+                if best_eeg.dtype == np.float64:
+                    best_eeg = best_eeg.astype(np.float32)
                 return best_eeg
         
         return None
@@ -474,6 +529,10 @@ class ZuCoDataset(Dataset):
             
             if eeg is None:
                 return []
+            
+            # Convert to float32 to save memory if still float64
+            if eeg.dtype == np.float64:
+                eeg = eeg.astype(np.float32)
             
             # Extract frequency bands
             eeg_bands = self._extract_frequency_bands(eeg)
@@ -530,6 +589,10 @@ class ZuCoDataset(Dataset):
             
             if eeg is None:
                 return []
+            
+            # Convert to float32 to save memory if still float64
+            if eeg.dtype == np.float64:
+                eeg = eeg.astype(np.float32)
             
             # Ensure shape is (channels, time)
             if eeg.ndim == 2:
