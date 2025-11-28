@@ -33,6 +33,23 @@ def load_config(config_path: str):
     """Load configuration from YAML file"""
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+    
+    # Ensure numeric types are properly converted (YAML might load 1e-4 as string)
+    if 'training' in config:
+        if 'learning_rate' in config['training']:
+            lr = config['training']['learning_rate']
+            if isinstance(lr, str):
+                config['training']['learning_rate'] = float(lr)
+            elif not isinstance(lr, (int, float)):
+                config['training']['learning_rate'] = float(lr)
+        
+        if 'weight_decay' in config['training']:
+            wd = config['training']['weight_decay']
+            if isinstance(wd, str):
+                config['training']['weight_decay'] = float(wd)
+            elif not isinstance(wd, (int, float)):
+                config['training']['weight_decay'] = float(wd)
+    
     return config
 
 
