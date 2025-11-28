@@ -363,30 +363,30 @@ class ZuCoDataset(Dataset):
                     if 'data' in eeg_group.keys():
                         # Get the data reference
                         data_ref = eeg_group['data']
-                                    if isinstance(data_ref, h5py.Dataset):
-                                        # If it's a reference, follow it
-                                        try:
-                                            if data_ref.dtype == h5py.special_dtype(ref=h5py.Reference):
-                                                ref_path = data_ref[0, 0] if data_ref.ndim >= 2 else data_ref[0]
-                                                actual_data = f[ref_path]
-                                                # Convert to float32 immediately to save memory (50% reduction)
-                                                data_arr = np.array(actual_data, dtype=np.float32) if actual_data.dtype.kind == 'f' else np.array(actual_data)
-                                                # MATLAB stores data transposed in v7.3
-                                                if data_arr.ndim == 2:
-                                                    data_arr = data_arr.T
-                                                data['data'] = data_arr
-                                                data['EEG'] = {'data': data_arr}
-                                        except Exception as e:
-                                            # If reference doesn't work, try direct access
-                                            try:
-                                                # Convert to float32 immediately to save memory
-                                                data_arr = np.array(data_ref, dtype=np.float32) if data_ref.dtype.kind == 'f' else np.array(data_ref)
-                                                if data_arr.ndim == 2:
-                                                    data_arr = data_arr.T
-                                                data['data'] = data_arr
-                                                data['EEG'] = {'data': data_arr}
-                                            except Exception as e2:
-                                                pass
+                        if isinstance(data_ref, h5py.Dataset):
+                            # If it's a reference, follow it
+                            try:
+                                if data_ref.dtype == h5py.special_dtype(ref=h5py.Reference):
+                                    ref_path = data_ref[0, 0] if data_ref.ndim >= 2 else data_ref[0]
+                                    actual_data = f[ref_path]
+                                    # Convert to float32 immediately to save memory (50% reduction)
+                                    data_arr = np.array(actual_data, dtype=np.float32) if actual_data.dtype.kind == 'f' else np.array(actual_data)
+                                    # MATLAB stores data transposed in v7.3
+                                    if data_arr.ndim == 2:
+                                        data_arr = data_arr.T
+                                    data['data'] = data_arr
+                                    data['EEG'] = {'data': data_arr}
+                            except Exception as e:
+                                # If reference doesn't work, try direct access
+                                try:
+                                    # Convert to float32 immediately to save memory
+                                    data_arr = np.array(data_ref, dtype=np.float32) if data_ref.dtype.kind == 'f' else np.array(data_ref)
+                                    if data_arr.ndim == 2:
+                                        data_arr = data_arr.T
+                                    data['data'] = data_arr
+                                    data['EEG'] = {'data': data_arr}
+                                except Exception as e2:
+                                    pass
                 
                 # Also try to find any large numeric datasets
                 def extract_data(name, obj):
