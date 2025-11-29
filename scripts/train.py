@@ -278,12 +278,21 @@ def main():
     print(f"  ✓ Validation dataset: {len(val_dataset)} samples")
     
     print("\n[STAGE 5/7] Creating data loaders...")
+    # Use num_workers=0 on Windows to avoid multiprocessing memory issues
+    # On Linux/Mac, you can use num_workers > 0 if you have enough RAM
+    import sys
+    if sys.platform == 'win32':
+        num_workers = 0  # Windows multiprocessing can cause MemoryError
+        print("  ⚠ Using num_workers=0 (Windows compatibility mode to avoid memory issues)")
+    else:
+        num_workers = config.get('num_workers', 0)  # Default to 0 if not specified
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=True,
         collate_fn=lambda x: collate_fn(x, tokenizer, config['data']['max_seq_length']),
-        num_workers=config['num_workers']
+        num_workers=num_workers
     )
     
     val_loader = DataLoader(
@@ -291,7 +300,7 @@ def main():
         batch_size=config['training']['batch_size'],
         shuffle=False,
         collate_fn=lambda x: collate_fn(x, tokenizer, config['data']['max_seq_length']),
-        num_workers=config['num_workers']
+        num_workers=num_workers
     )
     print(f"  ✓ Train batches: {len(train_loader)}")
     print(f"  ✓ Validation batches: {len(val_loader)}")
