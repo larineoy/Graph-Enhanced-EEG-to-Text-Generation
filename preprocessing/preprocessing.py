@@ -369,20 +369,32 @@ class ZuCoDataset(Dataset):
                                 if data_ref.dtype == h5py.special_dtype(ref=h5py.Reference):
                                     ref_path = data_ref[0, 0] if data_ref.ndim >= 2 else data_ref[0]
                                     actual_data = f[ref_path]
-                                    # Convert to float32 immediately to save memory (50% reduction)
-                                    data_arr = np.array(actual_data, dtype=np.float32) if actual_data.dtype.kind == 'f' else np.array(actual_data)
+                                    # FORCE float32 for all floating point arrays to save memory
+                                    if actual_data.dtype.kind == 'f':
+                                        data_arr = np.array(actual_data, dtype=np.float32)
+                                    else:
+                                        data_arr = np.array(actual_data)
                                     # MATLAB stores data transposed in v7.3
                                     if data_arr.ndim == 2:
                                         data_arr = data_arr.T
+                                    # Final safety check: convert to float32 if still float64
+                                    if data_arr.dtype == np.float64:
+                                        data_arr = data_arr.astype(np.float32)
                                     data['data'] = data_arr
                                     data['EEG'] = {'data': data_arr}
                             except Exception as e:
                                 # If reference doesn't work, try direct access
                                 try:
-                                    # Convert to float32 immediately to save memory
-                                    data_arr = np.array(data_ref, dtype=np.float32) if data_ref.dtype.kind == 'f' else np.array(data_ref)
+                                    # FORCE float32 for all floating point arrays to save memory
+                                    if data_ref.dtype.kind == 'f':
+                                        data_arr = np.array(data_ref, dtype=np.float32)
+                                    else:
+                                        data_arr = np.array(data_ref)
                                     if data_arr.ndim == 2:
                                         data_arr = data_arr.T
+                                    # Final safety check: convert to float32 if still float64
+                                    if data_arr.dtype == np.float64:
+                                        data_arr = data_arr.astype(np.float32)
                                     data['data'] = data_arr
                                     data['EEG'] = {'data': data_arr}
                                 except Exception as e2:
@@ -401,8 +413,18 @@ class ZuCoDataset(Dataset):
                             try:
                                 # Check shape first without loading full array
                                 if obj.shape and obj.size > 100:
-                                    # Load and convert to float32 immediately to save memory (50% reduction)
-                                    arr = np.array(obj, dtype=np.float32) if obj.dtype.kind == 'f' else np.array(obj)
+                                    # FORCE float32 conversion for ALL floating point arrays to save memory
+                                    if obj.dtype.kind == 'f':
+                                        arr = np.array(obj, dtype=np.float32)
+                                    elif obj.dtype.kind in ['i', 'u']:
+                                        # For integers, keep as-is but convert large int64 to int32
+                                        if obj.dtype.itemsize >= 8:  # int64 or uint64
+                                            arr = np.array(obj, dtype=np.int32 if obj.dtype.kind == 'i' else np.uint32)
+                                        else:
+                                            arr = np.array(obj)
+                                    else:
+                                        arr = np.array(obj)
+                                    
                                     # Only store if it's numeric and reasonably sized
                                     if arr.dtype.kind in ['f', 'i', 'u']:
                                         # MATLAB stores data transposed in v7.3
