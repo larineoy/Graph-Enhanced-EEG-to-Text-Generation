@@ -1086,11 +1086,35 @@ class ZuCoDataset(Dataset):
         # 3. Z-score normalization
         eeg_raw = sample['eeg_raw'].copy()
         
-        # First batch can be slow - preprocessing is computationally intensive
-        # This is expected behavior: each sample requires filtering and frequency extraction
-        if idx < 3 and len(self.samples) > 0:  # Show first 3 samples for progress indication
+        # Show progress for first batch processing (important for num_workers=0 on Windows)
+        # With sequential processing, the first batch won't be ready until all samples are processed
+        if not hasattr(self, '_last_progress_idx'):
+            self._last_progress_idx = -1
+        
+        # Show progress every 5 samples or for first 10 samples
+        should_show = (idx < 10) or (idx % 5 == 0) or (idx == self._last_progress_idx + 1 and idx < 20)
+        
+        if should_show and idx != self._last_progress_idx:
             import sys
-            print(f"  [DataLoader] Processing sample {idx+1}/{len(self.samples)} (preprocessing + frequency extraction)...", file=sys.stderr, flush=True)
+            import time
+            if not hasattr(self, '_first_sample_time'):
+                self._first_sample_time = time.time()
+                elapsed = 0
+            else:
+                elapsed = time.time() - self._first_sample_time
+            
+            # Estimate time remaining (rough estimate based on first few samples)
+            if idx > 0 and elapsed > 0:
+                samples_per_sec = idx / elapsed
+                remaining_samples = len(self.samples) - idx - 1
+                eta_seconds = remaining_samples / samples_per_sec if samples_per_sec > 0 else 0
+                eta_str = f" (ETA: {eta_seconds:.0f}s)" if eta_seconds > 0 else ""
+            else:
+                eta_str = ""
+            
+            print(f"  [DataLoader] Processing sample {idx+1}/{len(self.samples)} (preprocessing + frequency extraction){eta_str}...", 
+                  file=sys.stderr, flush=True)
+            self._last_progress_idx = idx
         
         eeg_preprocessed = self._preprocess_eeg(eeg_raw)
         
