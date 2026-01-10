@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 import os
 import json
 from tqdm import tqdm
@@ -97,7 +97,7 @@ def create_model(config, device):
     return model
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, config):
+def train_epoch(model, dataloader, optimizer, scheduler, criterion, device, config):
     """Train for one epoch"""
     model.train()
     total_loss = 0.0
@@ -116,10 +116,12 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config):
         # Shift for teacher forcing
         targets = text_tokens[:, 1:]
         
-        # Get text embeddings for contrastive loss (simplified)
-        # In practice, you'd use a pretrained text encoder
-        text_embeds = None
-        eeg_embeds = strg_output['stre_embeds'].squeeze(1).mean(dim=1)  # (batch_size, embed_dim)
+        # Get embeddings for contrastive loss
+        # EEG embeddings: average over temporal dimension (currently single window, so just squeeze)
+        eeg_embeds = strg_output['stre_embeds'].squeeze(1)  # (batch_size, graph_embed_dim)
+        
+        # Text embeddings: obtained from model's text encoder
+        text_embeds = strg_output.get('text_embeds', None)  # (batch_size, graph_embed_dim)
         
         loss, loss_dict = criterion(
             logits=logits,
@@ -138,6 +140,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config):
         torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['gradient_clip'])
         
         optimizer.step()
+        scheduler.step()  # Update learning rate
         
         total_loss += loss.item()
         loss_history.append(loss_dict)
@@ -277,6 +280,25 @@ def main():
     print(f"  ✓ Train dataset: {len(train_dataset)} samples")
     print(f"  ✓ Validation dataset: {len(val_dataset)} samples")
     
+    # Extract actual number of channels from ZuCo data (not from config)
+    # This ensures we use the actual channel count from the dataset, not a hardcoded value
+    actual_num_channels = train_dataset.num_channels
+    if actual_num_channels is None:
+        raise ValueError("Could not determine number of channels from ZuCo dataset. Check data loading.")
+    
+    # Verify validation dataset has same channel count
+    val_num_channels = val_dataset.num_channels
+    if val_num_channels is not None and val_num_channels != actual_num_channels:
+        raise ValueError(
+            f"Channel count mismatch: train has {actual_num_channels} channels, "
+            f"validation has {val_num_channels} channels. All samples must have the same channel count."
+        )
+    
+    print(f"  ✓ Using {actual_num_channels} channels from ZuCo data (not hardcoded)")
+    
+    # Override config with actual channel count from ZuCo data
+    config['model']['num_channels'] = actual_num_channels
+    
     print("\n[STAGE 5/7] Creating data loaders...")
     # Use num_workers=0 on Windows to avoid multiprocessing memory issues
     # On Linux/Mac, you can use num_workers > 0 if you have enough RAM
@@ -306,8 +328,18 @@ def main():
     print(f"  ✓ Validation batches: {len(val_loader)}")
     
     print("\n[STAGE 6/7] Initializing model...")
-    # Create model
+    # Create model with actual channel count from ZuCo data
     model = create_model(config, device)
+    
+    # Set electrode positions from ZuCo dataset if available (from chanlocs)
+    if train_dataset.electrode_positions is not None:
+        import torch
+        electrode_positions_tensor = torch.from_numpy(train_dataset.electrode_positions).float()
+        model.set_electrode_positions(electrode_positions_tensor)
+        print(f"  ✓ Using {len(train_dataset.electrode_positions)} electrode positions from ZuCo chanlocs (X, Y, Z)")
+    else:
+        print(f"  ⚠ No electrode positions found in ZuCo files, using standard 10-20 positions")
+    
     model = model.to(device)
     
     # Count parameters
@@ -324,6 +356,18 @@ def main():
         weight_decay=config['training']['weight_decay']
     )
     print(f"  ✓ Optimizer: AdamW (lr={config['training']['learning_rate']})")
+    
+    # Create learning rate scheduler with warmup
+    warmup_steps = config['training'].get('warmup_steps', 1000)
+    total_training_steps = len(train_loader) * config['training']['num_epochs']
+    
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_training_steps
+    )
+    print(f"  ✓ Learning rate scheduler: Linear warmup ({warmup_steps} steps) + linear decay")
+    print(f"    Total training steps: {total_training_steps}")
     
     # Create loss function
     criterion = CompositeLoss(
@@ -342,6 +386,8 @@ def main():
         checkpoint = torch.load(args.resume)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         print(f"  ✓ Resumed from epoch {start_epoch}, best val loss: {best_val_loss:.4f}")
@@ -367,7 +413,7 @@ def main():
         print(f'\nEpoch {epoch+1}/{config["training"]["num_epochs"]}')
         
         # Train
-        train_loss, train_loss_history = train_epoch(model, train_loader, optimizer, criterion, device, config)
+        train_loss, train_loss_history = train_epoch(model, train_loader, optimizer, scheduler, criterion, device, config)
         print(f'Train Loss: {train_loss:.4f}')
         
         # Validate
@@ -411,6 +457,7 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'best_val_loss': best_val_loss,
                 'config': config
             }
@@ -423,6 +470,7 @@ def main():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'best_val_loss': best_val_loss,
                 'config': config
             }
