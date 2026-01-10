@@ -1209,13 +1209,16 @@ class ZuCoDataset(Dataset):
                       file=sys.stderr, flush=True)
             
             # Convert to tensors
+            # Use .copy() to ensure contiguous memory layout and avoid negative stride errors
             if debug_this_sample:
                 import sys
                 print(f"  [DEBUG] Sample {idx+1}: Converting to tensors...", file=sys.stderr, flush=True)
             
-            eeg_raw_tensor = torch.FloatTensor(eeg_preprocessed)
+            # Ensure contiguous arrays before tensor conversion (fixes negative stride error)
+            eeg_preprocessed_contiguous = np.ascontiguousarray(eeg_preprocessed, dtype=np.float32)
+            eeg_raw_tensor = torch.FloatTensor(eeg_preprocessed_contiguous)
             eeg_bands_tensor = {
-                band_name: torch.FloatTensor(band_eeg)
+                band_name: torch.FloatTensor(np.ascontiguousarray(band_eeg, dtype=np.float32))
                 for band_name, band_eeg in eeg_bands.items()
             }
             
