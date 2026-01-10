@@ -863,29 +863,54 @@ class ZuCoDataset(Dataset):
         Returns dict with keys: 'delta', 'theta', 'alpha', 'beta', 'gamma'
         Each value is array of shape (C, T)
         """
+        import sys
+        
         num_channels, time_steps = eeg.shape
+        
+        # Check for invalid input
+        if np.any(np.isnan(eeg)) or np.any(np.isinf(eeg)):
+            print(f"  [WARNING] Input EEG contains NaN/Inf, filling with zeros", file=sys.stderr, flush=True)
+            eeg = np.nan_to_num(eeg, nan=0.0, posinf=0.0, neginf=0.0)
+        
         bands = {}
         nyquist = self.sampling_rate / 2
         
+        # Check if signal is too short for filtering (once, not per channel)
+        if time_steps < 10:
+            print(f"  [WARNING] Signal too short ({time_steps} samples) for filtering, using original", 
+                  file=sys.stderr, flush=True)
+            # Return original signal for all bands if too short
+            for band_name in self.FREQUENCY_BANDS.keys():
+                bands[band_name] = eeg.copy()
+            return bands
+        
         for band_name, (low_freq, high_freq) in self.FREQUENCY_BANDS.items():
-            band_eeg = np.zeros((num_channels, time_steps))
-            
             # Normalize frequencies
             low_norm = low_freq / nyquist
             high_norm = high_freq / nyquist
             high_norm = min(high_norm, 0.99)  # Cap at Nyquist
             
-            for ch in range(num_channels):
-                try:
-                    # Apply bandpass filter
-                    b, a = signal.butter(4, [low_norm, high_norm], btype='band')
-                    filtered = signal.filtfilt(b, a, eeg[ch, :])
-                    band_eeg[ch, :] = filtered
-                except:
-                    # If filtering fails, use original signal
-                    band_eeg[ch, :] = eeg[ch, :]
-            
-            bands[band_name] = band_eeg
+            try:
+                # Design bandpass filter once for all channels
+                b, a = signal.butter(4, [low_norm, high_norm], btype='band')
+                
+                # Vectorized filtering: apply to all channels at once
+                band_eeg = signal.filtfilt(b, a, eeg, axis=1)
+                
+                # Check for NaN/Inf in filtered result
+                if np.any(np.isnan(band_eeg)) or np.any(np.isinf(band_eeg)):
+                    # Fallback: use original signal where filtering failed
+                    invalid_mask = np.isnan(band_eeg) | np.isinf(band_eeg)
+                    band_eeg[invalid_mask] = eeg[invalid_mask]
+                    print(f"  [WARNING] Filtering produced NaN/Inf in {band_name} band, using original signal where needed", 
+                          file=sys.stderr, flush=True)
+                
+                bands[band_name] = band_eeg
+            except Exception as e:
+                # If filtering fails, use original signal
+                print(f"  [WARNING] Filtering failed for {band_name} band: {e}, using original signal", 
+                      file=sys.stderr, flush=True)
+                bands[band_name] = eeg.copy()
         
         return bands
     
@@ -919,22 +944,40 @@ class ZuCoDataset(Dataset):
             return eeg
         
         num_channels, time_steps = eeg.shape
-        filtered_eeg = np.zeros_like(eeg)
+        
+        # Check for invalid input
+        if np.any(np.isnan(eeg)) or np.any(np.isinf(eeg)):
+            eeg = np.nan_to_num(eeg, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Skip filtering if signal is too short
+        if time_steps < 10:
+            return eeg
+        
         nyquist = self.sampling_rate / 2
         cutoff_norm = self.highpass_cutoff / nyquist
+        cutoff_norm = min(cutoff_norm, 0.99)  # Cap at Nyquist
         
-        for ch in range(num_channels):
-            try:
-                # Design high-pass Butterworth filter
-                b, a = signal.butter(4, cutoff_norm, btype='high')
-                # Apply zero-phase filtering (forward and backward)
-                filtered_eeg[ch, :] = signal.filtfilt(b, a, eeg[ch, :])
-            except Exception as e:
-                # If filtering fails, use original signal
-                print(f"Warning: High-pass filtering failed for channel {ch}: {e}")
-                filtered_eeg[ch, :] = eeg[ch, :]
-        
-        return filtered_eeg
+        try:
+            # Design high-pass Butterworth filter (once for all channels)
+            b, a = signal.butter(4, cutoff_norm, btype='high')
+            
+            # Vectorized filtering: apply to all channels at once using axis parameter
+            # filtfilt can handle 2D arrays with axis parameter for vectorized operation
+            filtered_eeg = signal.filtfilt(b, a, eeg, axis=1)
+            
+            # Check for NaN/Inf in results
+            if np.any(np.isnan(filtered_eeg)) or np.any(np.isinf(filtered_eeg)):
+                # Fallback: use original signal where filtering failed
+                invalid_mask = np.isnan(filtered_eeg) | np.isinf(filtered_eeg)
+                filtered_eeg[invalid_mask] = eeg[invalid_mask]
+            
+            return filtered_eeg
+        except Exception as e:
+            # If filtering fails, return original signal
+            import sys
+            print(f"Warning: High-pass filtering failed: {e}, using original signal", 
+                  file=sys.stderr, flush=True)
+            return eeg
     
     def _apply_notch_filter(self, eeg: np.ndarray) -> np.ndarray:
         """
@@ -950,21 +993,37 @@ class ZuCoDataset(Dataset):
             return eeg
         
         num_channels, time_steps = eeg.shape
-        filtered_eeg = np.zeros_like(eeg)
+        
+        # Check for invalid input
+        if np.any(np.isnan(eeg)) or np.any(np.isinf(eeg)):
+            eeg = np.nan_to_num(eeg, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Skip filtering if signal is too short
+        if time_steps < 10:
+            return eeg
+        
         quality_factor = 30.0  # Quality factor for notch filter
         
-        for ch in range(num_channels):
-            try:
-                # Design notch filter (removes specific frequency)
-                b, a = signal.iirnotch(self.notch_freq, quality_factor, self.sampling_rate)
-                # Apply zero-phase filtering
-                filtered_eeg[ch, :] = signal.filtfilt(b, a, eeg[ch, :])
-            except Exception as e:
-                # If filtering fails, use original signal
-                print(f"Warning: Notch filtering failed for channel {ch}: {e}")
-                filtered_eeg[ch, :] = eeg[ch, :]
-        
-        return filtered_eeg
+        try:
+            # Design notch filter (once for all channels)
+            b, a = signal.iirnotch(self.notch_freq, quality_factor, self.sampling_rate)
+            
+            # Vectorized filtering: apply to all channels at once
+            filtered_eeg = signal.filtfilt(b, a, eeg, axis=1)
+            
+            # Check for NaN/Inf in results
+            if np.any(np.isnan(filtered_eeg)) or np.any(np.isinf(filtered_eeg)):
+                # Fallback: use original signal where filtering failed
+                invalid_mask = np.isnan(filtered_eeg) | np.isinf(filtered_eeg)
+                filtered_eeg[invalid_mask] = eeg[invalid_mask]
+            
+            return filtered_eeg
+        except Exception as e:
+            # If filtering fails, return original signal
+            import sys
+            print(f"Warning: Notch filtering failed: {e}, using original signal", 
+                  file=sys.stderr, flush=True)
+            return eeg
     
     def _detect_bad_channels(self, eeg: np.ndarray) -> List[int]:
         """
@@ -1078,65 +1137,111 @@ class ZuCoDataset(Dataset):
         return len(self.samples)
     
     def __getitem__(self, idx):
-        sample = self.samples[idx]
-        
-        # Step 1: Preprocess raw EEG first (following paper order):
-        # 1. High-pass filtering (0.5 Hz)
-        # 2. Notch filtering (50/60 Hz)
-        # 3. Z-score normalization
-        eeg_raw = sample['eeg_raw'].copy()
-        
-        # Show progress for first batch processing (important for num_workers=0 on Windows)
-        # With sequential processing, the first batch won't be ready until all samples are processed
-        if not hasattr(self, '_last_progress_idx'):
-            self._last_progress_idx = -1
-        
-        # Show progress every 5 samples or for first 10 samples
-        should_show = (idx < 10) or (idx % 5 == 0) or (idx == self._last_progress_idx + 1 and idx < 20)
-        
-        if should_show and idx != self._last_progress_idx:
+        try:
+            sample = self.samples[idx]
+            
+            # Step 1: Preprocess raw EEG first (following paper order):
+            # 1. High-pass filtering (0.5 Hz)
+            # 2. Notch filtering (50/60 Hz)
+            # 3. Z-score normalization
+            eeg_raw = sample['eeg_raw'].copy()
+            
+            # Show progress for first batch processing (important for num_workers=0 on Windows)
+            # With sequential processing, the first batch won't be ready until all samples are processed
+            if not hasattr(self, '_last_progress_idx'):
+                self._last_progress_idx = -1
+            
+            # Show progress every 5 samples or for first 10 samples
+            should_show = (idx < 10) or (idx % 5 == 0) or (idx == self._last_progress_idx + 1 and idx < 20)
+            
+            if should_show and idx != self._last_progress_idx:
+                import sys
+                import time
+                if not hasattr(self, '_first_sample_time'):
+                    self._first_sample_time = time.time()
+                    elapsed = 0
+                else:
+                    elapsed = time.time() - self._first_sample_time
+                
+                # Estimate time remaining (rough estimate based on first few samples)
+                if idx > 0 and elapsed > 0:
+                    samples_per_sec = idx / elapsed
+                    remaining_samples = len(self.samples) - idx - 1
+                    eta_seconds = remaining_samples / samples_per_sec if samples_per_sec > 0 else 0
+                    eta_str = f" (ETA: {eta_seconds:.0f}s)" if eta_seconds > 0 else ""
+                else:
+                    eta_str = ""
+                
+                print(f"  [DataLoader] Processing sample {idx+1}/{len(self.samples)} (preprocessing + frequency extraction){eta_str}...", 
+                      file=sys.stderr, flush=True)
+                self._last_progress_idx = idx
+            
+            # Add more detailed progress for samples that might be problematic
+            debug_this_sample = (idx >= 70 and idx <= 80)  # Debug samples around 76
+            if debug_this_sample:
+                import sys
+                print(f"  [DEBUG] Sample {idx+1}: shape={eeg_raw.shape}, dtype={eeg_raw.dtype}, min={eeg_raw.min():.2f}, max={eeg_raw.max():.2f}", 
+                      file=sys.stderr, flush=True)
+            
+            # Preprocess EEG
+            if debug_this_sample:
+                import sys
+                print(f"  [DEBUG] Sample {idx+1}: Starting preprocessing...", file=sys.stderr, flush=True)
+            
+            eeg_preprocessed = self._preprocess_eeg(eeg_raw)
+            
+            if debug_this_sample:
+                import sys
+                print(f"  [DEBUG] Sample {idx+1}: Preprocessing done, shape={eeg_preprocessed.shape}", 
+                      file=sys.stderr, flush=True)
+            
+            # Step 2: Extract frequency bands from preprocessed EEG
+            # Paper: "Following artifact removal, each EEG window is decomposed into five canonical oscillatory bands"
+            if debug_this_sample:
+                import sys
+                print(f"  [DEBUG] Sample {idx+1}: Starting frequency extraction...", file=sys.stderr, flush=True)
+            
+            eeg_bands = self._extract_frequency_bands(eeg_preprocessed)
+            
+            if debug_this_sample:
+                import sys
+                print(f"  [DEBUG] Sample {idx+1}: Frequency extraction done, bands={list(eeg_bands.keys())}", 
+                      file=sys.stderr, flush=True)
+            
+            # Convert to tensors
+            if debug_this_sample:
+                import sys
+                print(f"  [DEBUG] Sample {idx+1}: Converting to tensors...", file=sys.stderr, flush=True)
+            
+            eeg_raw_tensor = torch.FloatTensor(eeg_preprocessed)
+            eeg_bands_tensor = {
+                band_name: torch.FloatTensor(band_eeg)
+                for band_name, band_eeg in eeg_bands.items()
+            }
+            
+            if debug_this_sample:
+                import sys
+                print(f"  [DEBUG] Sample {idx+1}: Tensor conversion done", file=sys.stderr, flush=True)
+            
+            return {
+                'eeg_raw': eeg_raw_tensor,           # (C, T) - preprocessed
+                'eeg_bands': eeg_bands_tensor,       # Dict of (C, T) tensors - extracted from preprocessed EEG
+                'sentence_text': sample['sentence_text'],
+                'subject': sample['subject'],
+                'task': sample['task'],
+                'text': sample['sentence_text']      # For compatibility with existing code
+            }
+        except Exception as e:
             import sys
-            import time
-            if not hasattr(self, '_first_sample_time'):
-                self._first_sample_time = time.time()
-                elapsed = 0
-            else:
-                elapsed = time.time() - self._first_sample_time
-            
-            # Estimate time remaining (rough estimate based on first few samples)
-            if idx > 0 and elapsed > 0:
-                samples_per_sec = idx / elapsed
-                remaining_samples = len(self.samples) - idx - 1
-                eta_seconds = remaining_samples / samples_per_sec if samples_per_sec > 0 else 0
-                eta_str = f" (ETA: {eta_seconds:.0f}s)" if eta_seconds > 0 else ""
-            else:
-                eta_str = ""
-            
-            print(f"  [DataLoader] Processing sample {idx+1}/{len(self.samples)} (preprocessing + frequency extraction){eta_str}...", 
+            import traceback
+            print(f"\n  [ERROR] Failed to process sample {idx+1}/{len(self.samples)}", file=sys.stderr, flush=True)
+            print(f"  [ERROR] Subject: {sample.get('subject', 'unknown')}, Task: {sample.get('task', 'unknown')}", 
                   file=sys.stderr, flush=True)
-            self._last_progress_idx = idx
-        
-        eeg_preprocessed = self._preprocess_eeg(eeg_raw)
-        
-        # Step 2: Extract frequency bands from preprocessed EEG
-        # Paper: "Following artifact removal, each EEG window is decomposed into five canonical oscillatory bands"
-        eeg_bands = self._extract_frequency_bands(eeg_preprocessed)
-        
-        # Convert to tensors
-        eeg_raw_tensor = torch.FloatTensor(eeg_preprocessed)
-        eeg_bands_tensor = {
-            band_name: torch.FloatTensor(band_eeg)
-            for band_name, band_eeg in eeg_bands.items()
-        }
-        
-        return {
-            'eeg_raw': eeg_raw_tensor,           # (C, T) - preprocessed
-            'eeg_bands': eeg_bands_tensor,       # Dict of (C, T) tensors - extracted from preprocessed EEG
-            'sentence_text': sample['sentence_text'],
-            'subject': sample['subject'],
-            'task': sample['task'],
-            'text': sample['sentence_text']      # For compatibility with existing code
-        }
+            print(f"  [ERROR] Error: {str(e)}", file=sys.stderr, flush=True)
+            print(f"  [ERROR] Traceback:", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+            # Re-raise to see full error
+            raise
 
 
 def collate_fn(batch, tokenizer=None, max_seq_length=128):
