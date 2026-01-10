@@ -6,7 +6,6 @@ Creates model variants for ablation experiments
 import torch
 import torch.nn as nn
 from typing import Optional, Dict
-from models import GraphEnhancedEEG2Text, STRG, STRE
 
 
 class AblationModelFactory:
@@ -36,6 +35,9 @@ class AblationModelFactory:
         Returns:
             model: Model instance for ablation study
         """
+        # Lazy import to avoid circular dependency
+        from models import GraphEnhancedEEG2Text
+        
         if ablation_type == 'full':
             return GraphEnhancedEEG2Text(
                 num_channels=base_config['num_channels'],
@@ -77,6 +79,7 @@ class AblationModelFactory:
         
         elif ablation_type == 'static_only':
             # Only spatial topology
+            # Lazy import already done above
             return GraphEnhancedEEG2Text(
                 **{k: v for k, v in base_config.items() if k != 'use_functional_connectivity'},
                 use_spatial_topology=True,
@@ -87,6 +90,7 @@ class AblationModelFactory:
         
         elif ablation_type == 'dynamic_only':
             # Only functional connectivity
+            # Lazy import already done above
             return GraphEnhancedEEG2Text(
                 **{k: v for k, v in base_config.items() if k != 'use_spatial_topology'},
                 use_spatial_topology=False,
@@ -97,6 +101,7 @@ class AblationModelFactory:
         
         elif ablation_type == 'graph_only':
             # No temporal modeling - just graph readout
+            # Lazy import already done above
             return GraphEnhancedEEG2Text(
                 **base_config,
                 num_temporal_layers=0,  # Disable temporal Transformer

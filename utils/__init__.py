@@ -19,7 +19,8 @@ from .statistics import (
     save_results_table_with_errors,
     aggregate_multi_seed_results
 )
-from .ablation import AblationModelFactory, get_ablation_loss_weights
+# Note: ablation.py imports from models, so we don't import it here to avoid circular dependency
+# Import it directly in scripts that need it: from utils.ablation import AblationModelFactory
 from .cross_subject import CrossSubjectEvaluator
 from .baselines import (
     create_shuffled_channel_baseline,
@@ -50,8 +51,7 @@ __all__ = [
     'compute_significance_matrix',
     'save_results_table_with_errors',
     'aggregate_multi_seed_results',
-    'AblationModelFactory',
-    'get_ablation_loss_weights',
+    # 'AblationModelFactory', 'get_ablation_loss_weights' - imported directly in scripts to avoid circular dependency
     'CrossSubjectEvaluator',
     'create_shuffled_channel_baseline',
     'create_shuffled_time_baseline',
