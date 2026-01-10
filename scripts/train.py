@@ -453,25 +453,77 @@ def main():
         }
         training_log.append(log_entry)
         
-        # Visualize learned graphs periodically
-        if (epoch + 1) % 10 == 0:
+        # Visualize learned graphs periodically (comprehensive STRG visualizations for paper)
+        if (epoch + 1) % config['training'].get('visualize_every', 10) == 0:
             try:
-                from utils.visualization import save_adjacency_heatmap
+                from utils.visualization import visualize_strg_comprehensive, save_graph_evolution
+                import json
+                
                 model.eval()
                 sample_batch = next(iter(val_loader))
                 sample_eeg_bands = {k: v[:1].to(device) for k, v in sample_batch['eeg_bands'].items()}
+                
+                # Get electrode positions and channel names if available
+                electrode_positions = None
+                channel_names = None
+                if hasattr(train_dataset, 'electrode_positions') and train_dataset.electrode_positions is not None:
+                    electrode_positions = train_dataset.electrode_positions
+                if hasattr(train_dataset, 'channel_names') and train_dataset.channel_names is not None:
+                    channel_names = train_dataset.channel_names
+                
+                # Generate comprehensive STRG visualizations
+                epoch_viz_dir = os.path.join(viz_dir, f'epoch_{epoch+1}')
+                os.makedirs(epoch_viz_dir, exist_ok=True)
+                
+                visualize_strg_comprehensive(
+                    model.strg,
+                    sample_eeg_bands,
+                    epoch_viz_dir,
+                    epoch=epoch+1,
+                    electrode_positions=electrode_positions,
+                    channel_names=channel_names
+                )
+                
+                # Also save simple adjacency heatmap for quick reference
                 with torch.no_grad():
                     A, _, _ = model.strg(sample_eeg_bands)
                     A_np = A[0].cpu().numpy()
+                    from utils.visualization import save_adjacency_heatmap
                     save_adjacency_heatmap(
                         A_np,
-                        os.path.join(viz_dir, f'adjacency_epoch_{epoch+1}.png'),
-                        title=f'Learned Adjacency Matrix - Epoch {epoch+1}',
+                        os.path.join(epoch_viz_dir, 'adjacency_heatmap.png'),
+                        title=f'STRG Adjacency Matrix - Epoch {epoch+1}',
                         frequency_bands=['delta', 'theta', 'alpha', 'beta', 'gamma'],
                         num_channels=config['model']['num_channels']
                     )
+                
+                print(f"  ✓ Saved comprehensive STRG visualizations to {epoch_viz_dir}")
+                
+                # Store graph evolution (save adjacency matrices for later comparison)
+                if epoch == 0 or (epoch + 1) % 20 == 0:  # Every 20 epochs
+                    graph_evolution_file = os.path.join(viz_dir, 'graph_evolution.npz')
+                    evolution_data = {}
+                    if os.path.exists(graph_evolution_file):
+                        evolution_data = dict(np.load(graph_evolution_file))
+                    evolution_data[f'epoch_{epoch+1}'] = A_np
+                    np.savez(graph_evolution_file, **evolution_data)
+                    
+                    # Visualize evolution if we have enough epochs
+                    if len(evolution_data) >= 3:
+                        epochs_to_plot = sorted([k for k in evolution_data.keys()])[-6:]  # Last 6 epochs
+                        evolution_matrices = [evolution_data[e] for e in epochs_to_plot]
+                        evolution_titles = [f"Epoch {e.replace('epoch_', '')}" for e in epochs_to_plot]
+                        save_graph_evolution(
+                            evolution_matrices,
+                            os.path.join(viz_dir, 'graph_evolution_timeline.png'),
+                            titles=evolution_titles,
+                            ncols=3
+                        )
+                
             except Exception as e:
-                print(f"Warning: Could not save visualization: {e}")
+                import traceback
+                print(f"Warning: Could not save comprehensive visualization: {e}")
+                traceback.print_exc()
         
         # Save checkpoint
         if val_loss < best_val_loss:

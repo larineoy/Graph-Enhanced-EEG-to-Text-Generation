@@ -286,4 +286,84 @@ class STRG(nn.Module):
         A = torch.stack(batch_A)  # (batch_size, num_nodes, num_nodes)
         
         return A, node_features, bandpowers
+    
+    def extract_strg_components(self, eeg_bands: Dict[str, torch.Tensor], return_separate: bool = False):
+        """
+        Extract STRG components separately for visualization purposes
+        
+        Args:
+            eeg_bands: Dictionary of frequency bands
+            return_separate: If True, return spatial, functional, and combined separately
+            
+        Returns:
+            If return_separate=False: Same as forward() - (A, node_features, bandpowers)
+            If return_separate=True: Dict with keys:
+                - 'A_combined': Combined adjacency (batch_size, num_nodes, num_nodes)
+                - 'A_spatial': Spatial adjacency (num_nodes, num_nodes)
+                - 'A_functional_per_band': Dict of functional connectivity per band (num_channels, num_channels)
+                - 'A_functional_full': Full functional matrix (num_nodes, num_nodes)
+                - 'node_features': Node features (batch_size, num_nodes, node_dim)
+                - 'bandpowers': Bandpowers (batch_size, num_channels, num_frequency_bands)
+        """
+        if not return_separate:
+            return self.forward(eeg_bands)
+        
+        # Get batch size and device
+        first_band = list(eeg_bands.values())[0]
+        batch_size, num_channels, time_steps = first_band.shape
+        num_nodes = self.num_channels * self.num_frequency_bands
+        device = first_band.device
+        
+        # Ensure A_spatial is on correct device
+        A_spatial = self.A_spatial.to(device)
+        
+        # Compute bandpowers and node features (same as forward)
+        bandpowers_list = []
+        for band_name in self.frequency_band_names:
+            if band_name not in eeg_bands:
+                raise ValueError(f"Missing frequency band: {band_name}")
+            band_data = eeg_bands[band_name]
+            bandpowers_band = self._compute_bandpower(band_data)
+            bandpowers_list.append(bandpowers_band)
+        
+        bandpowers = torch.stack(bandpowers_list, dim=2)
+        node_features = bandpowers.permute(0, 2, 1).reshape(batch_size, -1, 1)
+        
+        # Extract functional connectivity per band
+        A_functional_per_band = {}
+        A_functional_full = torch.zeros(num_nodes, num_nodes, device=device)
+        
+        if self.use_functional_connectivity:
+            for f_idx, band_name in enumerate(self.frequency_band_names):
+                # Use first sample for visualization
+                band_data = eeg_bands[band_name][0]  # (C, T)
+                A_func_band = self._compute_functional_connectivity(band_data)  # (C, C)
+                A_functional_per_band[band_name] = A_func_band.cpu().numpy()
+                
+                # Place in full matrix
+                base_idx = f_idx * self.num_channels
+                A_functional_full[base_idx:base_idx+self.num_channels, 
+                                base_idx:base_idx+self.num_channels] = A_func_band
+        
+        # Compute combined (for first sample)
+        if self.use_spatial_topology and self.use_functional_connectivity:
+            A_combined_sample = self.alpha * A_spatial + self.beta * A_functional_full
+        elif self.use_spatial_topology:
+            A_combined_sample = A_spatial
+        elif self.use_functional_connectivity:
+            A_combined_sample = A_functional_full
+        else:
+            A_combined_sample = torch.eye(num_nodes, device=device)
+        
+        # Build full batch (for consistency with forward)
+        A_combined_batch = A_combined_sample.unsqueeze(0).repeat(batch_size, 1, 1)
+        
+        return {
+            'A_combined': A_combined_batch.cpu().numpy(),
+            'A_spatial': A_spatial.cpu().numpy(),
+            'A_functional_per_band': A_functional_per_band,
+            'A_functional_full': A_functional_full.cpu().numpy(),
+            'node_features': node_features.cpu().numpy(),
+            'bandpowers': bandpowers.cpu().numpy()
+        }
 

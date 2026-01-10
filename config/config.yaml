@@ -77,6 +77,7 @@ training:
   checkpoint_dir: "checkpoints"
   save_every: 5
   log_every: 100
+  visualize_every: 10  # Generate comprehensive STRG visualizations every N epochs (0 to disable)
 
 # Evaluation
 evaluation:
