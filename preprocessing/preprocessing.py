@@ -80,6 +80,8 @@ class ZuCoDataset(Dataset):
         self.bad_channel_threshold = bad_channel_threshold
         
         # Detect ZuCo version if not specified
+        # Extract channel count from actual ZuCo data (not hardcoded)
+        self.num_channels = None  # Will be determined from data
         if version is None:
             if os.path.exists(os.path.join(data_dir, 'ZuCo_1.0')):
                 version = '1.0'
@@ -94,6 +96,31 @@ class ZuCoDataset(Dataset):
         start_time = time.time()
         self.samples = self._load_aligned_samples()
         load_time = time.time() - start_time
+        
+        # Extract actual number of channels and electrode positions from ZuCo data (not hardcoded)
+        if len(self.samples) > 0:
+            # Get channel count from first sample's EEG data
+            first_sample = self.samples[0]
+            if 'eeg_raw' in first_sample:
+                eeg_shape = first_sample['eeg_raw'].shape
+                if len(eeg_shape) == 2:  # (channels, time)
+                    detected_channels = eeg_shape[0]
+                    self.num_channels = detected_channels
+                    print(f"  ✓ Detected {detected_channels} channels from ZuCo data")
+                else:
+                    raise ValueError(f"Unexpected EEG shape: {eeg_shape}. Expected (channels, time)")
+            else:
+                raise ValueError("No 'eeg_raw' found in samples")
+            
+            # Extract electrode positions from first sample if available (from ZuCo chanlocs)
+            if 'channel_info' in first_sample and 'electrode_positions' in first_sample['channel_info']:
+                self.electrode_positions = first_sample['channel_info']['electrode_positions']
+                print(f"  ✓ Extracted {len(self.electrode_positions)} electrode positions from ZuCo chanlocs (X, Y, Z)")
+            elif 'channel_info' in first_sample and 'channel_names' in first_sample['channel_info']:
+                self.channel_names = first_sample['channel_info']['channel_names']
+                print(f"  ✓ Extracted {len(self.channel_names)} channel names from ZuCo")
+        else:
+            raise ValueError("No samples loaded from ZuCo dataset")
         
         # Split data if not 'all'
         if split != 'all':
@@ -347,19 +374,116 @@ class ZuCoDataset(Dataset):
         """
         Load MATLAB v7.3 (HDF5) file using h5py
         Handles EEGLAB structure files which have EEG structure with data field
+        Extracts channel metadata if available in ZuCo files
         
         Args:
             filepath: Path to .mat file
             
         Returns:
-            dict: Dictionary similar to scipy.io.loadmat output
+            dict: Dictionary with 'data' (EEG array) and optionally 'channel_info' (metadata)
         """
         data = {}
+        channel_info = {}
+        
         try:
             with h5py.File(filepath, 'r') as f:
                 # For EEGLAB files, look for EEG structure
                 if 'EEG' in f.keys():
                     eeg_group = f['EEG']
+                    
+                    # Extract channel metadata from ZuCo files (chanlocs contains X, Y, Z positions!)
+                    if 'chanlocs' in eeg_group.keys():
+                        try:
+                            chanlocs = eeg_group['chanlocs']
+                            if isinstance(chanlocs, h5py.Group):
+                                # Extract X, Y, Z coordinates and labels from chanlocs
+                                # ZuCo stores these as arrays in the chanlocs group
+                                electrode_positions = []
+                                channel_names = []
+                                
+                                # Check if chanlocs has direct X, Y, Z arrays (EEGLAB format)
+                                if 'X' in chanlocs.keys() and 'Y' in chanlocs.keys() and 'Z' in chanlocs.keys():
+                                    try:
+                                        X_ref = chanlocs['X']
+                                        Y_ref = chanlocs['Y']
+                                        Z_ref = chanlocs['Z']
+                                        
+                                        # Follow references if needed
+                                        # ZuCo stores X, Y, Z as HDF5 datasets or references
+                                        def get_array(ref):
+                                            """Extract array from HDF5 dataset or reference"""
+                                            if isinstance(ref, h5py.Dataset):
+                                                if ref.dtype == h5py.special_dtype(ref=h5py.Reference):
+                                                    # Reference type - follow the reference
+                                                    if ref.ndim >= 2:
+                                                        ref_path = f[ref[0, 0]]
+                                                    else:
+                                                        ref_path = f[ref[0]]
+                                                    return np.array(ref_path)
+                                                else:
+                                                    # Direct dataset - read values
+                                                    return np.array(ref)
+                                            else:
+                                                # Already an array or group
+                                                return np.array(ref)
+                                        
+                                        X_arr = get_array(X_ref)
+                                        Y_arr = get_array(Y_ref)
+                                        Z_arr = get_array(Z_ref)
+                                        
+                                        # Ensure they're 1D arrays
+                                        if X_arr.ndim > 1:
+                                            X_arr = X_arr.flatten()
+                                        if Y_arr.ndim > 1:
+                                            Y_arr = Y_arr.flatten()
+                                        if Z_arr.ndim > 1:
+                                            Z_arr = Z_arr.flatten()
+                                        
+                                        # Stack into (num_channels, 3) array
+                                        num_chans = len(X_arr)
+                                        if len(Y_arr) == num_chans and len(Z_arr) == num_chans:
+                                            positions = np.stack([X_arr, Y_arr, Z_arr], axis=1)
+                                            channel_info['electrode_positions'] = positions.astype(np.float32)
+                                        
+                                        # Extract channel labels if available
+                                        if 'labels' in chanlocs.keys():
+                                            labels_ref = chanlocs['labels']
+                                            labels_arr = get_array(labels_ref)
+                                            if labels_arr.ndim > 1:
+                                                labels_arr = labels_arr.flatten()
+                                            # Convert to strings (may be stored as character codes)
+                                            if labels_arr.dtype.kind in ['U', 'S', 'O']:
+                                                channel_names = [str(l) for l in labels_arr[:num_chans]]
+                                            elif labels_arr.dtype == np.object_:
+                                                # Try to decode each label
+                                                channel_names = []
+                                                for i in range(min(num_chans, len(labels_arr))):
+                                                    try:
+                                                        label_ref = labels_arr[i]
+                                                        if isinstance(label_ref, h5py.Reference):
+                                                            label_data = f[label_ref]
+                                                            if isinstance(label_data, h5py.Dataset):
+                                                                label_str = ''.join([chr(c) for c in label_data[:] if c > 0])
+                                                                channel_names.append(label_str)
+                                                    except:
+                                                        channel_names.append(f'CH{i+1}')
+                                            if channel_names:
+                                                channel_info['channel_names'] = channel_names
+                                    except Exception as e:
+                                        pass  # Extraction failed, continue without positions
+                        except Exception as e:
+                            pass  # Channel metadata extraction failed, continue without it
+                    
+                    # Extract number of channels if available
+                    if 'nbchan' in eeg_group.keys():
+                        try:
+                            nbchan_ref = eeg_group['nbchan']
+                            if isinstance(nbchan_ref, h5py.Dataset):
+                                nbchan = int(nbchan_ref[0, 0] if nbchan_ref.ndim >= 2 else nbchan_ref[0])
+                                channel_info['num_channels'] = nbchan
+                        except Exception as e:
+                            pass
+                    
                     if 'data' in eeg_group.keys():
                         # Get the data reference
                         data_ref = eeg_group['data']
@@ -382,6 +506,8 @@ class ZuCoDataset(Dataset):
                                         data_arr = data_arr.astype(np.float32)
                                     data['data'] = data_arr
                                     data['EEG'] = {'data': data_arr}
+                                    if channel_info:
+                                        data['channel_info'] = channel_info
                             except Exception as e:
                                 # If reference doesn't work, try direct access
                                 try:
@@ -397,6 +523,8 @@ class ZuCoDataset(Dataset):
                                         data_arr = data_arr.astype(np.float32)
                                     data['data'] = data_arr
                                     data['EEG'] = {'data': data_arr}
+                                    if channel_info:
+                                        data['channel_info'] = channel_info
                                 except Exception as e2:
                                     pass
                 
@@ -459,6 +587,12 @@ class ZuCoDataset(Dataset):
         for key in ['EEG', 'eeg_data', 'data']:
             if key in mat_data:
                 eeg = mat_data[key]
+                
+                # Check if it's a structured EEG object with metadata
+                # ZuCo dataset may contain EEG structure with channel info
+                if isinstance(eeg, dict) and 'data' in eeg:
+                    # EEG structure from EEGLAB format
+                    eeg = eeg['data']
                 
                 # Handle nested structures (EEG structure might have .data field)
                 if isinstance(eeg, np.ndarray) and eeg.dtype.names:
@@ -556,35 +690,26 @@ class ZuCoDataset(Dataset):
             if eeg.dtype == np.float64:
                 eeg = eeg.astype(np.float32)
             
-            # Extract frequency bands
-            eeg_bands = self._extract_frequency_bands(eeg)
-            
-            # For ZuCo 1.0, treat entire recording as one sentence
-            # or segment if wordbounds available
+            # Store raw EEG only - frequency bands will be extracted after preprocessing in __getitem__
+            # For ZuCo 1.0, typically one sentence per EEG file
+            # Paper: "For each sentence s_i, we extract its corresponding EEG interval by 
+            # converting word-level timestamps into sample indices: [t_start, t_end] = floor(wordbound_i * f_s), f_s = 250 Hz"
+            # For ZuCo 1.0, the text corresponds to the entire EEG recording
             samples = []
             
-            if wordbounds:
-                # Use wordbounds to segment by sentence
-                # This is simplified - actual implementation would parse wordbounds structure
-                # For now, use entire recording as one sample
-                sample = {
-                    'eeg_raw': eeg,
-                    'eeg_bands': eeg_bands,
-                    'sentence_text': text,
-                    'subject': subject_id,
-                    'task': task_key
-                }
-                samples.append(sample)
-            else:
-                # No wordbounds - use entire recording
-                sample = {
-                    'eeg_raw': eeg,
-                    'eeg_bands': eeg_bands,
-                    'sentence_text': text,
-                    'subject': subject_id,
-                    'task': task_key
-                }
-                samples.append(sample)
+            # ZuCo 1.0: one sentence typically corresponds to one EEG file
+            # If wordbounds are available, we would segment here, but ZuCo 1.0 structure
+            # typically has one sentence per file, so use entire recording
+            sample = {
+                'eeg_raw': eeg,
+                'sentence_text': text,
+                'subject': subject_id,
+                'task': task_key
+            }
+            # Include channel_info if available (electrode positions from ZuCo chanlocs)
+            if 'channel_info' in eeg_data:
+                sample['channel_info'] = eeg_data['channel_info']
+            samples.append(sample)
             
             return samples
             
@@ -640,12 +765,9 @@ class ZuCoDataset(Dataset):
                         # Extract EEG window for this sentence
                         eeg_window = eeg[:, start_idx:end_idx]
                         
-                        # Extract frequency bands for this window
-                        eeg_bands = self._extract_frequency_bands(eeg_window)
-                        
+                        # Store raw EEG only - frequency bands will be extracted after preprocessing in __getitem__
                         sample = {
                             'eeg_raw': eeg_window,
-                            'eeg_bands': eeg_bands,
                             'sentence_text': sentences[i],
                             'subject': subject_id,
                             'task': f'{task_type}{task_num}_sent{i+1}'
@@ -660,11 +782,10 @@ class ZuCoDataset(Dataset):
                     
                     if end_idx > start_idx and end_idx <= time_steps:
                         eeg_window = eeg[:, start_idx:end_idx]
-                        eeg_bands = self._extract_frequency_bands(eeg_window)
                         
+                        # Store raw EEG only - frequency bands will be extracted after preprocessing in __getitem__
                         sample = {
                             'eeg_raw': eeg_window,
-                            'eeg_bands': eeg_bands,
                             'sentence_text': sentence,
                             'subject': subject_id,
                             'task': f'{task_type}{task_num}_sent{i+1}'
@@ -679,28 +800,61 @@ class ZuCoDataset(Dataset):
     
     def _extract_sentence_windows(self, wordbounds: Dict, task_num: int, total_time: int) -> List[Tuple[int, int]]:
         """
-        Extract sentence-level time windows from wordbounds
-        Returns list of (start_idx, end_idx) tuples in samples
+        Extract sentence-level time windows from wordbounds per paper specification.
+        
+        Paper: "For each sentence s_i, we extract its corresponding EEG interval by 
+        converting word-level timestamps into sample indices:
+        [t_start^(i), t_end^(i)] = floor(wordbound_i * f_s), f_s = 250 Hz"
+        
+        Args:
+            wordbounds: Dictionary containing wordbound timing information
+            task_num: Task number for matching wordbounds
+            total_time: Total time steps in the EEG recording
+            
+        Returns:
+            List of (start_idx, end_idx) tuples in sample indices
         """
         windows = []
         
-        # Try to find relevant wordbounds data
-        # This is a simplified version - actual wordbounds structure may vary
+        # Try to find relevant wordbounds data for this task
+        # Wordbounds structure in ZuCo varies, but typically contains timing arrays
         for key, data in wordbounds.items():
             if isinstance(data, np.ndarray):
-                # Try to extract sentence boundaries
-                # Structure depends on actual wordbounds format
+                # Handle different wordbound formats
                 if data.ndim == 1 and len(data) > 0:
-                    # Simple case: array of sentence end times
+                    # Case 1: Array of sentence end times (cumulative)
+                    # Convert to sample indices: floor(time * f_s)
                     prev_idx = 0
                     for end_time in data:
-                        end_idx = int(end_time * self.sampling_rate)
-                        if end_idx > prev_idx:
-                            windows.append((prev_idx, min(end_idx, total_time)))
+                        end_idx = int(np.floor(end_time * self.sampling_rate))  # Paper formula: floor(wordbound_i * f_s)
+                        if end_idx > prev_idx and end_idx <= total_time:
+                            windows.append((prev_idx, end_idx))
                             prev_idx = end_idx
+                elif data.ndim == 2 and data.shape[0] >= 2:
+                    # Case 2: (2, N) array with start and end times
+                    # First row: start times, second row: end times
+                    start_times = data[0, :] if data.shape[0] >= 1 else data[:, 0]
+                    end_times = data[1, :] if data.shape[0] >= 2 else data[:, 1]
+                    for start_time, end_time in zip(start_times, end_times):
+                        start_idx = int(np.floor(start_time * self.sampling_rate))
+                        end_idx = int(np.floor(end_time * self.sampling_rate))
+                        if end_idx > start_idx and end_idx <= total_time:
+                            windows.append((start_idx, end_idx))
+                elif isinstance(data, dict):
+                    # Case 3: Nested structure with timing information
+                    # Try to extract timing arrays from nested structure
+                    for subkey, subdata in data.items():
+                        if isinstance(subdata, np.ndarray) and subdata.ndim == 1:
+                            prev_idx = 0
+                            for end_time in subdata:
+                                end_idx = int(np.floor(end_time * self.sampling_rate))
+                                if end_idx > prev_idx and end_idx <= total_time:
+                                    windows.append((prev_idx, end_idx))
+                                    prev_idx = end_idx
         
-        # Fallback: if no valid windows found, return empty list
-        # (will trigger fallback segmentation)
+        # Paper: "If timestamp annotations are partially unavailable, EEG recordings 
+        # are segmented proportionally across sentences following ZuCo's experimental protocol"
+        # If no valid windows found, return empty list to trigger proportional segmentation
         return windows
     
     def _extract_frequency_bands(self, eeg: np.ndarray) -> Dict[str, np.ndarray]:
@@ -926,25 +1080,27 @@ class ZuCoDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         
-        # Preprocess raw EEG
+        # Step 1: Preprocess raw EEG first (following paper order):
+        # 1. High-pass filtering (0.5 Hz)
+        # 2. Notch filtering (50/60 Hz)
+        # 3. Z-score normalization
         eeg_raw = sample['eeg_raw'].copy()
-        eeg_raw = self._preprocess_eeg(eeg_raw)
+        eeg_preprocessed = self._preprocess_eeg(eeg_raw)
         
-        # Preprocess frequency bands
-        eeg_bands_processed = {}
-        for band_name, band_eeg in sample['eeg_bands'].items():
-            eeg_bands_processed[band_name] = self._preprocess_eeg(band_eeg.copy())
+        # Step 2: Extract frequency bands from preprocessed EEG
+        # Paper: "Following artifact removal, each EEG window is decomposed into five canonical oscillatory bands"
+        eeg_bands = self._extract_frequency_bands(eeg_preprocessed)
         
         # Convert to tensors
-        eeg_raw_tensor = torch.FloatTensor(eeg_raw)
+        eeg_raw_tensor = torch.FloatTensor(eeg_preprocessed)
         eeg_bands_tensor = {
             band_name: torch.FloatTensor(band_eeg)
-            for band_name, band_eeg in eeg_bands_processed.items()
+            for band_name, band_eeg in eeg_bands.items()
         }
         
         return {
-            'eeg_raw': eeg_raw_tensor,           # (C, T)
-            'eeg_bands': eeg_bands_tensor,       # Dict of (C, T) tensors
+            'eeg_raw': eeg_raw_tensor,           # (C, T) - preprocessed
+            'eeg_bands': eeg_bands_tensor,       # Dict of (C, T) tensors - extracted from preprocessed EEG
             'sentence_text': sample['sentence_text'],
             'subject': sample['subject'],
             'task': sample['task'],
@@ -1007,12 +1163,13 @@ def collate_fn(batch, tokenizer=None, max_seq_length=128):
         )
         text_tokens = tokenized['input_ids']
     else:
-        # Simple word-level tokenization (fallback)
-        text_tokens = torch.zeros(len(texts), max_seq_length, dtype=torch.long)
-        for i, text in enumerate(texts):
-            words = text.split()[:max_seq_length]
-            for j, word in enumerate(words):
-                text_tokens[i, j] = hash(word) % 10000  # Placeholder
+        # Error: tokenizer is required for proper text encoding
+        # Paper uses standard tokenization procedures - raise error rather than using placeholder
+        raise ValueError(
+            "Tokenizer is required for text tokenization. "
+            "Please provide a tokenizer (e.g., from transformers library) in collate_fn. "
+            "The paper uses standard tokenization procedures which require a proper tokenizer."
+        )
     
     return {
         'eeg': eeg_raw_batch,          # (batch_size, C, T) - for compatibility
