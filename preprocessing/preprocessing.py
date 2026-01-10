@@ -1085,6 +1085,13 @@ class ZuCoDataset(Dataset):
         # 2. Notch filtering (50/60 Hz)
         # 3. Z-score normalization
         eeg_raw = sample['eeg_raw'].copy()
+        
+        # First batch can be slow - preprocessing is computationally intensive
+        # This is expected behavior: each sample requires filtering and frequency extraction
+        if idx < 3 and len(self.samples) > 0:  # Show first 3 samples for progress indication
+            import sys
+            print(f"  [DataLoader] Processing sample {idx+1}/{len(self.samples)} (preprocessing + frequency extraction)...", file=sys.stderr, flush=True)
+        
         eeg_preprocessed = self._preprocess_eeg(eeg_raw)
         
         # Step 2: Extract frequency bands from preprocessed EEG
