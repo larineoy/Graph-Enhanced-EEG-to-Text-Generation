@@ -10,7 +10,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from scipy.stats import pearsonr
-from typing import Dict
+from typing import Dict, Optional
+from utils.graph_utils import get_standard_10_20_positions, build_spatial_adjacency_from_positions
 
 
 class STRG(nn.Module):
@@ -31,7 +32,8 @@ class STRG(nn.Module):
         beta: float = 0.5,
         use_spatial_topology: bool = True,
         use_functional_connectivity: bool = True,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        electrode_positions: Optional[torch.Tensor] = None  # Actual positions from ZuCo chanlocs (X, Y, Z)
     ):
         """
         Args:
@@ -53,37 +55,73 @@ class STRG(nn.Module):
         self.device = device
         
         # Define frequency band names (must match preprocessing)
+        # Enforce that num_frequency_bands matches the standard 5 bands
+        assert num_frequency_bands == 5, f"num_frequency_bands must be 5 (got {num_frequency_bands}). Standard bands: delta, theta, alpha, beta, gamma"
         self.frequency_band_names = ['delta', 'theta', 'alpha', 'beta', 'gamma']
         
-        # Build spatial adjacency matrix (10-20 system topology)
+        # Store electrode positions if provided (from ZuCo chanlocs)
+        self.electrode_positions = electrode_positions
+        
+        # Build spatial adjacency matrix using actual ZuCo positions if available, else standard 10-20
+        # Build on CPU, register_buffer will handle device movement via model.to(device)
         self.register_buffer('A_spatial', self._build_spatial_adjacency())
         
     def _build_spatial_adjacency(self):
         """
-        Build static spatial adjacency matrix based on 10-20 electrode system.
-        Adjacent electrodes are connected if they are neighbors on the scalp.
+        Build static spatial adjacency matrix using ACTUAL electrode positions from ZuCo chanlocs.
+        
+        If electrode_positions are provided (extracted from ZuCo files), uses those.
+        Otherwise falls back to standard 10-20 positions based on ZuCo's known configuration.
+        
+        Uses electrode positions to determine spatial neighbors.
+        Adjacent electrodes are connected based on physical proximity on the scalp.
         """
-        A_spatial = torch.zeros(
-            self.num_channels * self.num_frequency_bands,
-            self.num_channels * self.num_frequency_bands,
-            device=self.device
+        # Use ACTUAL electrode positions from ZuCo chanlocs if available
+        if self.electrode_positions is not None:
+            # Convert to numpy if tensor
+            if isinstance(self.electrode_positions, torch.Tensor):
+                electrode_positions = self.electrode_positions.cpu().numpy()
+            else:
+                electrode_positions = self.electrode_positions
+            
+            # Ensure correct shape: (num_channels, 3) with X, Y, Z
+            if electrode_positions.shape[0] != self.num_channels:
+                raise ValueError(
+                    f"Electrode positions shape {electrode_positions.shape} doesn't match "
+                    f"num_channels {self.num_channels}"
+                )
+        else:
+            # Fallback: Get standard 10-20 system electrode positions
+            # This is used only if ZuCo files don't contain chanlocs metadata
+            electrode_positions = get_standard_10_20_positions(self.num_channels)
+        
+        # Build spatial adjacency for channels using k-nearest neighbors
+        # Use k=6 to connect each electrode to its 6 nearest neighbors (typical for 10-20 system)
+        A_spatial_channels = build_spatial_adjacency_from_positions(
+            electrode_positions,
+            k_nearest=6  # Connect to 6 nearest neighbors (matches typical 10-20 topology)
         )
         
-        # For each frequency band, connect channels that are spatially adjacent
-        # This is a simplified version - in practice, you'd use actual electrode positions
+        # Convert to torch tensor (on CPU - device will be handled by register_buffer)
+        A_spatial_channels = torch.from_numpy(A_spatial_channels).float()
+        
+        # Build full adjacency matrix: (num_channels * num_frequency_bands, num_channels * num_frequency_bands)
+        # Same spatial structure is replicated for each frequency band
+        # Nodes are ordered as: (ch0, delta), (ch1, delta), ..., (chC, delta), (ch0, theta), ...
+        A_spatial = torch.zeros(
+            self.num_channels * self.num_frequency_bands,
+            self.num_channels * self.num_frequency_bands
+        )
+        
+        # For each frequency band, use the same spatial adjacency structure
         for f in range(self.num_frequency_bands):
             base_idx = f * self.num_channels
-            # Connect adjacent channels (simplified grid topology)
-            for i in range(self.num_channels):
-                for j in range(self.num_channels):
-                    if i != j:
-                        # Simplified: connect if channels are close (you'd use actual distances)
-                        # Here we use a simple heuristic based on channel indices
-                        dist = abs(i - j)
-                        if dist <= 3:  # Connect if channels are relatively close
-                            A_spatial[base_idx + i, base_idx + j] = 1.0
-                        
-        # Symmetrize
+            A_spatial[
+                base_idx:base_idx + self.num_channels,
+                base_idx:base_idx + self.num_channels
+            ] = A_spatial_channels
+        
+        # Ensure symmetry (should already be symmetric, but enforce it)
         A_spatial = (A_spatial + A_spatial.T) / 2
         
         return A_spatial
@@ -106,6 +144,9 @@ class STRG(nn.Module):
         """
         Compute dynamic functional connectivity using Pearson correlation.
         
+        Note: Uses absolute correlation to ensure non-negative adjacency weights.
+        This is intentional for graph construction, though it differs from signed Pearson correlation.
+        
         Args:
             band_data: Band-filtered EEG of shape (num_channels, time_steps)
             
@@ -115,21 +156,35 @@ class STRG(nn.Module):
         num_channels, time_steps = band_data.shape
         device = band_data.device
         
+        # Check minimum time steps for reliable correlation estimation
+        if time_steps < 10:
+            print(f"Warning: Short time window ({time_steps} samples) may lead to unreliable correlation estimates")
+        
         # Normalize data (zero mean, unit variance per channel)
         band_data_norm = (band_data - torch.mean(band_data, dim=1, keepdim=True)) / (
             torch.std(band_data, dim=1, keepdim=True) + 1e-8
         )
         
         # Compute correlation matrix: (num_channels, num_channels)
-        # Correlation = (X @ X^T) / (time_steps - 1) for normalized data
+        # Pearson correlation = (X_norm @ X_norm^T) / (time_steps - 1) for normalized data
         A_functional = torch.matmul(band_data_norm, band_data_norm.T) / (time_steps - 1)
         
-        # Ensure diagonal is 1 and non-negative
+        # Use absolute correlation for non-negative adjacency weights
+        # Note: This differs from signed Pearson correlation but is standard for graph construction
+        # where edge weights should be non-negative. The absolute value preserves magnitude of correlation.
         A_functional = torch.abs(A_functional)
+        
+        # Ensure diagonal is 1 (self-connection)
         A_functional = A_functional - torch.diag(torch.diag(A_functional)) + torch.eye(num_channels, device=device)
         
         # Ensure symmetry
         A_functional = (A_functional + A_functional.T) / 2
+        
+        # Optional: Threshold sparse edges to reduce noise
+        # Uncomment to keep only top correlations (recommended for sparse graphs)
+        # threshold_percentile = 0.8  # Keep top 20% of edges
+        # threshold = torch.quantile(A_functional, threshold_percentile)
+        # A_functional = torch.where(A_functional >= threshold, A_functional, torch.zeros_like(A_functional))
         
         return A_functional
     
@@ -148,12 +203,29 @@ class STRG(nn.Module):
                node_dim = 1 (bandpower feature)
             bandpowers: Band power features of shape (batch_size, num_channels, num_frequency_bands)
         """
-        # Get batch size and check all bands have same shape
+        # Get batch size and validate input shapes
         first_band = list(eeg_bands.values())[0]
         batch_size, num_channels, time_steps = first_band.shape
         
+        # Shape consistency checks
+        assert num_channels == self.num_channels, (
+            f"Input has {num_channels} channels but model expects {self.num_channels} channels"
+        )
+        assert len(eeg_bands) == len(self.frequency_band_names), (
+            f"Input has {len(eeg_bands)} bands but expected {len(self.frequency_band_names)} bands"
+        )
+        
+        # Verify all bands have same shape
+        for band_name, band_data in eeg_bands.items():
+            assert band_data.shape == (batch_size, num_channels, time_steps), (
+                f"Band {band_name} has shape {band_data.shape} but expected ({batch_size}, {num_channels}, {time_steps})"
+            )
+        
         num_nodes = self.num_channels * self.num_frequency_bands
         device = first_band.device
+        
+        # Ensure A_spatial is on the same device as input
+        A_spatial = self.A_spatial.to(device)
         
         # Compute bandpowers for all bands and channels
         bandpowers_list = []
@@ -169,19 +241,9 @@ class STRG(nn.Module):
         
         # Build node features: each node = (channel, frequency_band) pair
         # Node order: (ch0, delta), (ch1, delta), ..., (chC, delta), (ch0, theta), ...
-        node_features_list = []
-        for b in range(batch_size):
-            node_feat_batch = []
-            for f_idx, band_name in enumerate(self.frequency_band_names):
-                for ch in range(self.num_channels):
-                    # Node feature = bandpower for this (channel, band) pair
-                    bandpower_val = bandpowers[b, ch, f_idx]
-                    node_feat_batch.append(bandpower_val)
-            
-            node_features_list.append(torch.stack(node_feat_batch))  # (num_nodes,)
-        
-        # Stack to (batch_size, num_nodes, 1)
-        node_features = torch.stack(node_features_list).unsqueeze(-1)  # (batch_size, num_nodes, 1)
+        # Vectorized construction: reshape (B, C, F) -> (B, F, C) -> (B, F*C) -> (B, F*C, 1)
+        # This matches node order: (ch0,delta), (ch1,delta), ..., (ch0,theta), ...
+        node_features = bandpowers.permute(0, 2, 1).reshape(batch_size, -1, 1)  # (batch_size, num_nodes, 1)
         
         # Build adjacency matrices
         batch_A = []
@@ -207,22 +269,18 @@ class STRG(nn.Module):
             
             # Combine spatial and functional adjacency
             if self.use_spatial_topology and self.use_functional_connectivity:
-                A = self.alpha * self.A_spatial + self.beta * A_functional_full
+                A = self.alpha * A_spatial + self.beta * A_functional_full
             elif self.use_spatial_topology:
-                A = self.A_spatial
+                A = A_spatial
             elif self.use_functional_connectivity:
                 A = A_functional_full
             else:
                 A = torch.eye(num_nodes, device=device)
             
-            # Normalize adjacency matrix (symmetric normalization)
-            D = torch.sum(A, dim=1)  # (num_nodes,)
-            D_inv_sqrt = torch.pow(D + 1e-8, -0.5)
-            D_inv_sqrt = torch.where(torch.isinf(D_inv_sqrt), torch.zeros_like(D_inv_sqrt), D_inv_sqrt)
-            D_inv_sqrt = torch.diag(D_inv_sqrt)
-            A_normalized = D_inv_sqrt @ A @ D_inv_sqrt
-            
-            batch_A.append(A_normalized)
+            # Note: GAT uses A > 0 only as a binary mask, so normalization values are ignored
+            # We keep adjacency as-is (unnormalized) since GAT computes its own attention weights
+            # If weighted adjacency is desired in future, normalization can be added here
+            batch_A.append(A)
         
         # Stack adjacency matrices
         A = torch.stack(batch_A)  # (batch_size, num_nodes, num_nodes)

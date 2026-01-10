@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Optional
 
 
 class GraphAttentionLayer(nn.Module):
@@ -155,8 +156,9 @@ class AttentionReadout(nn.Module):
         scores = torch.matmul(Wh, self.query)  # (batch_size, num_nodes)
         attention = F.softmax(scores, dim=1)  # (batch_size, num_nodes)
         
-        # Weighted aggregation
-        graph_embed = torch.sum(attention.unsqueeze(-1) * h, dim=1)  # (batch_size, node_dim)
+        # Weighted aggregation: aggregate the projected features Wh, not raw h
+        # This ensures output_dim matches the dimension of the projected features
+        graph_embed = torch.sum(attention.unsqueeze(-1) * Wh, dim=1)  # (batch_size, output_dim)
         
         return graph_embed
 
@@ -223,16 +225,21 @@ class STRE(nn.Module):
         """
         super(STRE, self).__init__()
         
+        self.node_dim = node_dim
+        self.graph_embed_dim = graph_embed_dim
+        
         # Project node features if needed
+        # Note: We apply this projection before GAT, so GAT receives projected features
         if node_dim != graph_embed_dim:
             self.node_proj = nn.Linear(node_dim, graph_embed_dim)
         else:
             self.node_proj = nn.Identity()
         
-        # GAT layers
+        # GAT layers: input_dim should match projected dimension
+        # If we project first, GAT receives graph_embed_dim features
         hidden_gat_dim = graph_embed_dim // 2 if num_gat_layers > 1 else graph_embed_dim
         self.gat = MultiLayerGAT(
-            input_dim=node_dim,
+            input_dim=graph_embed_dim,  # GAT receives projected features
             hidden_dim=hidden_gat_dim,
             output_dim=graph_embed_dim,
             num_layers=num_gat_layers,
@@ -256,37 +263,54 @@ class STRE(nn.Module):
         
         self.dropout = nn.Dropout(temporal_dropout)
     
-    def forward(self, A: torch.Tensor, node_features: torch.Tensor):
+    def forward(self, A: torch.Tensor, node_features: torch.Tensor, window_mask: Optional[torch.Tensor] = None):
         """
         Args:
             A: Adjacency matrices (batch_size, num_windows, num_nodes, num_nodes)
             node_features: Node features (batch_size, num_windows, num_nodes, node_dim)
+            window_mask: Optional mask for variable-length windows (batch_size, num_windows)
+                        where 1 = valid window, 0 = padding
             
         Returns:
             STRE: Spatio-temporal relational embeddings (batch_size, num_windows, graph_embed_dim)
         """
         batch_size, num_windows, num_nodes, node_dim = node_features.shape
-        graph_embed_dim = self.readout.query.shape[0]
+        
+        # Validate input dimensions
+        assert node_dim == self.node_dim, (
+            f"Input node_dim {node_dim} does not match expected {self.node_dim}"
+        )
         
         # Reshape for batch processing
         A_flat = A.view(-1, num_nodes, num_nodes)  # (batch_size * num_windows, num_nodes, num_nodes)
         h_flat = node_features.view(-1, num_nodes, node_dim)  # (batch_size * num_windows, num_nodes, node_dim)
         
+        # Project node features before GAT (if node_dim != graph_embed_dim)
+        h_projected = self.node_proj(h_flat)  # (batch_size * num_windows, num_nodes, graph_embed_dim)
+        
         # Graph encoding with GAT
-        h_gat = self.gat(h_flat, A_flat)  # (batch_size * num_windows, num_nodes, graph_embed_dim)
+        h_gat = self.gat(h_projected, A_flat)  # (batch_size * num_windows, num_nodes, graph_embed_dim)
         
         # Graph-level readout
         graph_embeds = self.readout(h_gat)  # (batch_size * num_windows, graph_embed_dim)
         
         # Reshape back to windows
-        graph_embeds = graph_embeds.view(batch_size, num_windows, graph_embed_dim)
+        graph_embeds = graph_embeds.view(batch_size, num_windows, self.graph_embed_dim)
         
         # Temporal encoding with Transformer
         graph_embeds = self.pos_encoding(graph_embeds)
         graph_embeds = self.dropout(graph_embeds)
         
+        # Create padding mask if provided (True = pad position, should be ignored)
+        src_key_padding_mask = None
+        if window_mask is not None:
+            src_key_padding_mask = (window_mask == 0)  # (batch_size, num_windows)
+        
         # Transformer expects (seq_len, batch, dim) or (batch, seq_len, dim) with batch_first=True
-        STRE_embeds = self.temporal_encoder(graph_embeds)  # (batch_size, num_windows, graph_embed_dim)
+        STRE_embeds = self.temporal_encoder(
+            graph_embeds,
+            src_key_padding_mask=src_key_padding_mask
+        )  # (batch_size, num_windows, graph_embed_dim)
         
         return STRE_embeds
 

@@ -7,6 +7,7 @@ Uses preprocessed eeg_bands from preprocessing pipeline.
 
 import torch
 import torch.nn as nn
+import numpy as np
 from typing import Dict, Optional
 from .strg import STRG
 from .stre import STRE
@@ -67,6 +68,7 @@ class GraphEnhancedEEG2Text(nn.Module):
         self.device = device
         
         # STRG construction
+        # electrode_positions will be set after model creation if available from ZuCo
         self.strg = STRG(
             num_channels=num_channels,
             num_frequency_bands=num_frequency_bands,
@@ -74,7 +76,8 @@ class GraphEnhancedEEG2Text(nn.Module):
             beta=strg_beta,
             use_spatial_topology=use_spatial_topology,
             use_functional_connectivity=use_functional_connectivity,
-            device=device
+            device=device,
+            electrode_positions=None  # Will be set from dataset if available
         )
         
         # STRE generation
@@ -106,6 +109,59 @@ class GraphEnhancedEEG2Text(nn.Module):
             dropout=decoder_dropout,
             max_decoder_length=max_decoder_length
         )
+        
+        # Text encoder for contrastive loss
+        # Uses shared token embeddings with decoder, then aggregates to sentence-level embedding
+        self.text_encoder = nn.Sequential(
+            nn.Linear(decoder_embed_dim, decoder_embed_dim),
+            nn.ReLU(),
+            nn.Dropout(decoder_dropout),
+            nn.Linear(decoder_embed_dim, graph_embed_dim)  # Match graph_embed_dim for contrastive loss
+        )
+    
+    def set_electrode_positions(self, electrode_positions: torch.Tensor):
+        """
+        Set electrode positions from ZuCo dataset chanlocs.
+        Rebuilds spatial adjacency matrix with actual positions.
+        
+        Args:
+            electrode_positions: Tensor of shape (num_channels, 3) with X, Y, Z coordinates
+        """
+        if electrode_positions is not None:
+            # Convert to tensor if numpy array
+            if isinstance(electrode_positions, np.ndarray):
+                electrode_positions = torch.from_numpy(electrode_positions).float()
+            
+            # Update STRG with actual positions
+            self.strg.electrode_positions = electrode_positions
+            # Rebuild spatial adjacency with actual positions
+            self.strg.register_buffer('A_spatial', self.strg._build_spatial_adjacency())
+    
+    def encode_text(self, text_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Encode text tokens to embeddings for contrastive loss.
+        
+        Args:
+            text_tokens: Token IDs of shape (batch_size, seq_len)
+            
+        Returns:
+            text_embeds: Sentence-level text embeddings of shape (batch_size, graph_embed_dim)
+        """
+        # Get token embeddings from decoder (shared embeddings)
+        token_embeds = self.decoder.token_embedding(text_tokens)  # (batch_size, seq_len, decoder_embed_dim)
+        
+        # Average pool over sequence length (can also use attention pooling)
+        # Mask out padding tokens (assume pad_token_id = 0)
+        mask = (text_tokens != 0).float().unsqueeze(-1)  # (batch_size, seq_len, 1)
+        masked_embeds = token_embeds * mask  # (batch_size, seq_len, decoder_embed_dim)
+        seq_lengths = mask.sum(dim=1, keepdim=True)  # (batch_size, 1, 1)
+        seq_lengths = torch.clamp(seq_lengths, min=1.0)  # Avoid division by zero
+        avg_embeds = masked_embeds.sum(dim=1) / seq_lengths.squeeze(-1)  # (batch_size, decoder_embed_dim)
+        
+        # Project to graph embedding dimension
+        text_embeds = self.text_encoder(avg_embeds)  # (batch_size, graph_embed_dim)
+        
+        return text_embeds
     
     def forward(
         self,
@@ -125,7 +181,7 @@ class GraphEnhancedEEG2Text(nn.Module):
         Returns:
             If training (tgt_tokens provided):
                 logits: Decoder output logits (batch_size, tgt_len-1, vocab_size)
-                strg_output: STRG outputs (A, node_features, bandpowers, stre_embeds) for loss computation
+                strg_output: STRG outputs (A, node_features, bandpowers, stre_embeds, text_embeds) for loss computation
             If inference:
                 memory: STRE embeddings (batch_size, 1, decoder_embed_dim)
                 strg_output: STRG outputs
@@ -136,11 +192,16 @@ class GraphEnhancedEEG2Text(nn.Module):
         # node_features: (batch_size, num_nodes, node_dim) where node_dim=1
         # bandpowers: (batch_size, num_channels, num_frequency_bands)
         
-        # Reshape for STRE: treat as single temporal window
+        # Reshape for STRE: treat as single temporal window (sentence-level alignment)
+        # Note: The paper mentions "word or sentence level windows aligned with text"
+        # Current implementation uses sentence-level windows, where each sentence corresponds to one EEG segment
+        # STRE architecture supports multiple temporal windows if word-level segmentation is desired in future
         A_windowed = A.unsqueeze(1)  # (batch_size, 1, num_nodes, num_nodes)
         node_features_windowed = node_features.unsqueeze(1)  # (batch_size, 1, num_nodes, node_dim)
         
         # Step 2: Generate STRE embeddings
+        # STRE processes temporal sequence: Z_{1:T} = Transformer(h_{1:T})
+        # For sentence-level: T=1 (single window per sentence)
         stre_embeds = self.stre(A_windowed, node_features_windowed)  # (batch_size, 1, graph_embed_dim)
         
         # Project to decoder dimension
@@ -165,11 +226,15 @@ class GraphEnhancedEEG2Text(nn.Module):
             )
             # logits: (batch_size, tgt_len-1, vocab_size)
             
+            # Encode text for contrastive loss
+            text_embeds = self.encode_text(tgt_tokens)  # (batch_size, graph_embed_dim)
+            
             return logits, {
                 'A': A,
                 'node_features': node_features,
                 'bandpowers': bandpowers,
-                'stre_embeds': stre_embeds
+                'stre_embeds': stre_embeds,
+                'text_embeds': text_embeds
             }
         else:
             # Inference mode - return memory for autoregressive generation
