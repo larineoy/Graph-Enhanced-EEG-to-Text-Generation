@@ -20,7 +20,7 @@ data:
 # Model parameters
 model:
   # EEG parameters
-  num_channels: 64  # Number of EEG channels
+  num_channels: 64  # Number of EEG channels (will be overridden by actual ZuCo data)
   num_frequency_bands: 5  # delta, theta, alpha, beta, gamma
   time_steps: 1000
   
