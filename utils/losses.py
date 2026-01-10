@@ -79,10 +79,11 @@ class CompositeLoss(nn.Module):
         
         # Weight by adjacency
         A_expanded = adjacency_matrix.unsqueeze(0) if adjacency_matrix.dim() == 2 else adjacency_matrix
+        # Paper formula: L_smooth = sum_{i,j} A_ij ||h_i - h_j||^2
         loss = torch.sum(A_expanded * diff_norm, dim=(1, 2))  # (batch_size,)
         
-        # Average over batch and normalize
-        loss = loss.mean() / (num_nodes * num_nodes)
+        # Average over batch (no normalization per paper formula)
+        loss = loss.mean()
         
         return loss
     
