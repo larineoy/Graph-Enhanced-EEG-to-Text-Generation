@@ -105,12 +105,30 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, device, conf
     
     pbar = tqdm(dataloader, desc='Training')
     for batch_idx, batch in enumerate(pbar):
+        if batch_idx == 0:
+            print(f"\n  [DEBUG] Starting first batch processing...")
+            print(f"  [DEBUG] Batch keys: {batch.keys()}")
+            if 'eeg_bands' in batch:
+                print(f"  [DEBUG] EEG bands: {list(batch['eeg_bands'].keys())}")
+                for band_name, band_tensor in batch['eeg_bands'].items():
+                    print(f"  [DEBUG]   {band_name}: shape={band_tensor.shape}, device={band_tensor.device}")
+            if 'text_tokens' in batch:
+                print(f"  [DEBUG] Text tokens: shape={batch['text_tokens'].shape}, device={batch['text_tokens'].device}")
+        
         # Use eeg_bands dict from preprocessing
+        if batch_idx == 0:
+            print(f"  [DEBUG] Moving data to device {device}...")
         eeg_bands = {band_name: band_tensor.to(device) for band_name, band_tensor in batch['eeg_bands'].items()}
         text_tokens = batch['text_tokens'].to(device)
         
+        if batch_idx == 0:
+            print(f"  [DEBUG] Data moved to device. Starting forward pass...")
+        
         # Forward pass
         logits, strg_output = model(eeg_bands, text_tokens)
+        
+        if batch_idx == 0:
+            print(f"  [DEBUG] Forward pass completed. Computing loss...")
         
         # Compute loss
         # Shift for teacher forcing
@@ -403,6 +421,11 @@ def main():
     os.makedirs(viz_dir, exist_ok=True)
     
     print("\n[STAGE 7/7] Starting training loop...")
+    print("="*70)
+    print(f"  Note: First batch may take longer due to:")
+    print(f"    - Data preprocessing (filtering, frequency extraction)")
+    print(f"    - Text tokenization")
+    print(f"    - Model initialization on first forward pass")
     print("="*70)
     
     # Training loop
