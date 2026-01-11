@@ -1191,8 +1191,7 @@ class ZuCoDataset(Dataset):
                 self._last_progress_idx = idx
             
             # Add more detailed progress for samples that might be problematic
-            # Extend debug range to catch issues with sample 91 and others
-            debug_this_sample = (idx >= 70 and idx <= 95) or (idx % 10 == 0)  # Debug samples around 76, 91, and every 10th
+            debug_this_sample = (idx >= 70 and idx <= 80)  # Debug samples around 76
             if debug_this_sample:
                 import sys
                 print(f"  [DEBUG] Sample {idx+1}: shape={eeg_raw.shape}, dtype={eeg_raw.dtype}, min={eeg_raw.min():.2f}, max={eeg_raw.max():.2f}", 
@@ -1266,7 +1265,7 @@ class ZuCoDataset(Dataset):
             raise
 
 
-def collate_fn(batch, tokenizer=None, max_seq_length=128, max_eeg_length=50000):
+def collate_fn(batch, tokenizer=None, max_seq_length=128, max_eeg_length=20000):
     """
     Collate function for DataLoader
     
@@ -1275,7 +1274,7 @@ def collate_fn(batch, tokenizer=None, max_seq_length=128, max_eeg_length=50000):
         tokenizer: Text tokenizer
         max_seq_length: Maximum sequence length for text
         max_eeg_length: Maximum time steps for EEG (to avoid memory issues)
-                        Default: 50000 (~200 seconds at 250Hz). Set to None to use batch max.
+                        Default: 20000 (~80 seconds at 250Hz). Set to None to use batch max.
         
     Returns:
         batched_data: Dictionary of batched tensors
