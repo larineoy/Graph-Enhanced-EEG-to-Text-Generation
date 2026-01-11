@@ -621,8 +621,13 @@ class ZuCoDataset(Dataset):
                         eeg = eeg.astype(np.float32)
                     
                     # Ensure shape is (channels, time)
+                    # ZuCo typically has ~105 channels, so if second dim is ~105 and first is much larger, likely (T, C)
                     if eeg.ndim == 2:
-                        if eeg.shape[0] < eeg.shape[1]:
+                        # If first dim > second dim and second dim is in typical channel range (~105), transpose
+                        if eeg.shape[0] > eeg.shape[1] and 50 < eeg.shape[1] < 200:
+                            eeg = eeg.T  # Transpose (T, C) -> (C, T)
+                        # Original check: if channels < time (but channels is reasonable), transpose
+                        elif eeg.shape[0] < eeg.shape[1] and eeg.shape[0] < 200:
                             eeg = eeg.T
                         return eeg
                     elif eeg.ndim == 3:
@@ -654,7 +659,11 @@ class ZuCoDataset(Dataset):
             
             # Ensure shape is (channels, time)
             if best_eeg.ndim == 2:
-                if best_eeg.shape[0] < best_eeg.shape[1]:
+                # If first dim > second dim and second dim is in typical channel range (~105), transpose
+                if best_eeg.shape[0] > best_eeg.shape[1] and 50 < best_eeg.shape[1] < 200:
+                    best_eeg = best_eeg.T  # Transpose (T, C) -> (C, T)
+                # Original check: if channels < time (but channels is reasonable), transpose
+                elif best_eeg.shape[0] < best_eeg.shape[1] and best_eeg.shape[0] < 200:
                     best_eeg = best_eeg.T
                 return best_eeg
             elif best_eeg.ndim == 3:
@@ -879,9 +888,9 @@ class ZuCoDataset(Dataset):
         if time_steps < 10:
             print(f"  [WARNING] Signal too short ({time_steps} samples) for filtering, using original", 
                   file=sys.stderr, flush=True)
-            # Return original signal for all bands if too short
+            # Return original signal for all bands if too short (make contiguous)
             for band_name in self.FREQUENCY_BANDS.keys():
-                bands[band_name] = eeg.copy()
+                bands[band_name] = np.ascontiguousarray(eeg.copy(), dtype=np.float32)
             return bands
         
         for band_name, (low_freq, high_freq) in self.FREQUENCY_BANDS.items():
@@ -905,12 +914,13 @@ class ZuCoDataset(Dataset):
                     print(f"  [WARNING] Filtering produced NaN/Inf in {band_name} band, using original signal where needed", 
                           file=sys.stderr, flush=True)
                 
-                bands[band_name] = band_eeg
+                # Ensure contiguous memory layout to avoid negative stride issues when converting to tensor
+                bands[band_name] = np.ascontiguousarray(band_eeg, dtype=np.float32)
             except Exception as e:
-                # If filtering fails, use original signal
+                # If filtering fails, use original signal (make contiguous)
                 print(f"  [WARNING] Filtering failed for {band_name} band: {e}, using original signal", 
                       file=sys.stderr, flush=True)
-                bands[band_name] = eeg.copy()
+                bands[band_name] = np.ascontiguousarray(eeg.copy(), dtype=np.float32)
         
         return bands
     
@@ -941,7 +951,7 @@ class ZuCoDataset(Dataset):
             filtered_eeg: High-pass filtered EEG
         """
         if not self.apply_highpass_filter:
-            return eeg
+            return np.ascontiguousarray(eeg, dtype=np.float32)
         
         num_channels, time_steps = eeg.shape
         
@@ -951,7 +961,7 @@ class ZuCoDataset(Dataset):
         
         # Skip filtering if signal is too short
         if time_steps < 10:
-            return eeg
+            return np.ascontiguousarray(eeg, dtype=np.float32)
         
         nyquist = self.sampling_rate / 2
         cutoff_norm = self.highpass_cutoff / nyquist
@@ -971,13 +981,14 @@ class ZuCoDataset(Dataset):
                 invalid_mask = np.isnan(filtered_eeg) | np.isinf(filtered_eeg)
                 filtered_eeg[invalid_mask] = eeg[invalid_mask]
             
-            return filtered_eeg
+            # Ensure contiguous memory layout to avoid negative stride issues when converting to tensor
+            return np.ascontiguousarray(filtered_eeg, dtype=np.float32)
         except Exception as e:
-            # If filtering fails, return original signal
+            # If filtering fails, return original signal (make contiguous)
             import sys
             print(f"Warning: High-pass filtering failed: {e}, using original signal", 
                   file=sys.stderr, flush=True)
-            return eeg
+            return np.ascontiguousarray(eeg, dtype=np.float32)
     
     def _apply_notch_filter(self, eeg: np.ndarray) -> np.ndarray:
         """
@@ -990,7 +1001,7 @@ class ZuCoDataset(Dataset):
             filtered_eeg: Notch-filtered EEG
         """
         if not self.apply_notch_filter:
-            return eeg
+            return np.ascontiguousarray(eeg, dtype=np.float32)
         
         num_channels, time_steps = eeg.shape
         
@@ -1000,7 +1011,7 @@ class ZuCoDataset(Dataset):
         
         # Skip filtering if signal is too short
         if time_steps < 10:
-            return eeg
+            return np.ascontiguousarray(eeg, dtype=np.float32)
         
         quality_factor = 30.0  # Quality factor for notch filter
         
@@ -1017,13 +1028,14 @@ class ZuCoDataset(Dataset):
                 invalid_mask = np.isnan(filtered_eeg) | np.isinf(filtered_eeg)
                 filtered_eeg[invalid_mask] = eeg[invalid_mask]
             
-            return filtered_eeg
+            # Ensure contiguous memory layout to avoid negative stride issues when converting to tensor
+            return np.ascontiguousarray(filtered_eeg, dtype=np.float32)
         except Exception as e:
-            # If filtering fails, return original signal
+            # If filtering fails, return original signal (make contiguous)
             import sys
             print(f"Warning: Notch filtering failed: {e}, using original signal", 
                   file=sys.stderr, flush=True)
-            return eeg
+            return np.ascontiguousarray(eeg, dtype=np.float32)
     
     def _detect_bad_channels(self, eeg: np.ndarray) -> List[int]:
         """
@@ -1073,7 +1085,7 @@ class ZuCoDataset(Dataset):
             eeg_interpolated: EEG with bad channels interpolated
         """
         if len(bad_channels) == 0:
-            return eeg
+            return np.ascontiguousarray(eeg, dtype=np.float32)
         
         eeg_interpolated = eeg.copy()
         num_channels = eeg.shape[0]
@@ -1097,7 +1109,8 @@ class ZuCoDataset(Dataset):
                 # If no adjacent channels, use zero padding (better than leaving as-is)
                 eeg_interpolated[bad_ch, :] = np.zeros(eeg.shape[1])
         
-        return eeg_interpolated
+        # Ensure contiguous memory layout
+        return np.ascontiguousarray(eeg_interpolated, dtype=np.float32)
     
     def _preprocess_eeg(self, eeg: np.ndarray) -> np.ndarray:
         """
@@ -1131,7 +1144,8 @@ class ZuCoDataset(Dataset):
         if self.normalize:
             eeg = (eeg - np.mean(eeg, axis=1, keepdims=True)) / (np.std(eeg, axis=1, keepdims=True) + 1e-8)
         
-        return eeg
+        # Ensure contiguous memory layout to avoid negative stride issues when converting to tensor
+        return np.ascontiguousarray(eeg, dtype=np.float32)
     
     def __len__(self):
         return len(self.samples)
@@ -1177,7 +1191,8 @@ class ZuCoDataset(Dataset):
                 self._last_progress_idx = idx
             
             # Add more detailed progress for samples that might be problematic
-            debug_this_sample = (idx >= 70 and idx <= 80)  # Debug samples around 76
+            # Extend debug range to catch issues with sample 91 and others
+            debug_this_sample = (idx >= 70 and idx <= 95) or (idx % 10 == 0)  # Debug samples around 76, 91, and every 10th
             if debug_this_sample:
                 import sys
                 print(f"  [DEBUG] Sample {idx+1}: shape={eeg_raw.shape}, dtype={eeg_raw.dtype}, min={eeg_raw.min():.2f}, max={eeg_raw.max():.2f}", 
@@ -1215,12 +1230,16 @@ class ZuCoDataset(Dataset):
                 print(f"  [DEBUG] Sample {idx+1}: Converting to tensors...", file=sys.stderr, flush=True)
             
             # Ensure contiguous arrays before tensor conversion (fixes negative stride error)
-            eeg_preprocessed_contiguous = np.ascontiguousarray(eeg_preprocessed, dtype=np.float32)
-            eeg_raw_tensor = torch.FloatTensor(eeg_preprocessed_contiguous)
-            eeg_bands_tensor = {
-                band_name: torch.FloatTensor(np.ascontiguousarray(band_eeg, dtype=np.float32))
-                for band_name, band_eeg in eeg_bands.items()
-            }
+            # Use .copy() first to ensure fresh memory, then ascontiguousarray for safety
+            eeg_preprocessed_contiguous = np.ascontiguousarray(eeg_preprocessed.copy(), dtype=np.float32)
+            eeg_raw_tensor = torch.from_numpy(eeg_preprocessed_contiguous)
+            
+            # Ensure all frequency bands are contiguous before tensor conversion
+            eeg_bands_tensor = {}
+            for band_name, band_eeg in eeg_bands.items():
+                # Make fresh copy and ensure contiguous (fixes negative stride issues)
+                band_eeg_contiguous = np.ascontiguousarray(band_eeg.copy(), dtype=np.float32)
+                eeg_bands_tensor[band_name] = torch.from_numpy(band_eeg_contiguous)
             
             if debug_this_sample:
                 import sys
@@ -1247,14 +1266,16 @@ class ZuCoDataset(Dataset):
             raise
 
 
-def collate_fn(batch, tokenizer=None, max_seq_length=128):
+def collate_fn(batch, tokenizer=None, max_seq_length=128, max_eeg_length=50000):
     """
     Collate function for DataLoader
     
     Args:
         batch: List of samples (from __getitem__)
         tokenizer: Text tokenizer
-        max_seq_length: Maximum sequence length
+        max_seq_length: Maximum sequence length for text
+        max_eeg_length: Maximum time steps for EEG (to avoid memory issues)
+                        Default: 50000 (~200 seconds at 250Hz). Set to None to use batch max.
         
     Returns:
         batched_data: Dictionary of batched tensors
@@ -1267,7 +1288,28 @@ def collate_fn(batch, tokenizer=None, max_seq_length=128):
     tasks = [item['task'] for item in batch]
     
     # Pad raw EEG to same length
+    # Detect format: (C, T) or (T, C)
+    # ZuCo data typically has ~105 channels, so if second dim is around 105, data is likely (T, C)
+    # Check first sample to determine format, then apply consistently to all
+    first_shape = eeg_raw_list[0].shape
+    needs_transpose = first_shape[0] > first_shape[1] and 50 < first_shape[1] < 200  # Typical channel count: ~105
+    if needs_transpose:
+        # Data is in (T, C) format, transpose all to (C, T)
+        eeg_raw_list = [eeg.T for eeg in eeg_raw_list]
+    
+    # Limit maximum sequence length to avoid memory issues
     max_eeg_len = max(e.shape[1] for e in eeg_raw_list)
+    original_max_len = max_eeg_len
+    if max_eeg_length is not None and max_eeg_len > max_eeg_length:
+        # Truncate sequences that are too long to limit memory usage
+        truncated_count = sum(1 for e in eeg_raw_list if e.shape[1] > max_eeg_length)
+        if truncated_count > 0:
+            import sys
+            print(f"  [WARNING] Truncating {truncated_count} sequences from {original_max_len} to {max_eeg_length} time steps to avoid memory issues", 
+                  file=sys.stderr, flush=True)
+        eeg_raw_list = [eeg[:, :max_eeg_length] if eeg.shape[1] > max_eeg_length else eeg for eeg in eeg_raw_list]
+        max_eeg_len = max_eeg_length
+    
     num_channels = eeg_raw_list[0].shape[0]
     
     eeg_raw_padded = []
@@ -1283,6 +1325,12 @@ def collate_fn(batch, tokenizer=None, max_seq_length=128):
     eeg_bands_batch = {}
     for band_name in eeg_bands_list[0].keys():
         band_list = [item[band_name] for item in eeg_bands_list]
+        # Transpose if needed (same format as raw EEG - use same detection logic)
+        if needs_transpose:
+            band_list = [band.T for band in band_list]
+        # Truncate if needed (same max length limit)
+        if max_eeg_length is not None:
+            band_list = [band[:, :max_eeg_len] if band.shape[1] > max_eeg_len else band for band in band_list]
         band_padded = []
         for band_eeg in band_list:
             if band_eeg.shape[1] < max_eeg_len:

@@ -62,14 +62,17 @@ class TransformerDecoder(nn.Module):
         self.pos_encoding = PositionalEncoding(embed_dim, max_decoder_length)
         
         # Decoder layers
+        # Note: TransformerDecoder doesn't support batch_first, so we use default (seq_len, batch_size, embed_dim)
+        # and manually transpose inputs/outputs
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
             dim_feedforward=ff_dim,
             dropout=dropout,
-            batch_first=True
+            batch_first=False  # TransformerDecoder expects (seq_len, batch_size, embed_dim)
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.max_decoder_length = max_decoder_length
         
         # Output projection
         self.output_proj = nn.Linear(embed_dim, vocab_size)
@@ -99,10 +102,25 @@ class TransformerDecoder(nn.Module):
         tgt_embeds = self.dropout(tgt_embeds)
         
         # Decoder forward pass
-        # memory: (batch_size, src_len, embed_dim) -> (src_len, batch_size, embed_dim) for Transformer
-        # tgt_embeds: (batch_size, tgt_len, embed_dim) -> (tgt_len, batch_size, embed_dim)
+        # TransformerDecoder expects (seq_len, batch_size, embed_dim) format
         memory_t = memory.transpose(0, 1)  # (src_len, batch_size, embed_dim)
         tgt_embeds_t = tgt_embeds.transpose(0, 1)  # (tgt_len, batch_size, embed_dim)
+        
+        # Ensure mask is correct shape for TransformerDecoder: (tgt_len, tgt_len)
+        # After transposing, tgt_len is the first dimension
+        expected_tgt_len = tgt_embeds_t.shape[0]
+        
+        if tgt_mask is not None:
+            # Check if mask shape matches expected sequence length
+            if len(tgt_mask.shape) == 2 and tgt_mask.shape[0] == expected_tgt_len and tgt_mask.shape[1] == expected_tgt_len:
+                # Mask shape is correct, use it
+                pass
+            else:
+                # Regenerate mask with correct sequence length
+                tgt_mask = self.generate_mask(expected_tgt_len, tgt_embeds_t.device)
+        else:
+            # Generate causal mask if not provided
+            tgt_mask = self.generate_mask(expected_tgt_len, tgt_embeds_t.device)
         
         decoder_output = self.decoder(
             tgt=tgt_embeds_t,
@@ -111,7 +129,7 @@ class TransformerDecoder(nn.Module):
             tgt_key_padding_mask=tgt_key_padding_mask
         )
         
-        # Transpose back
+        # Transpose back to batch_first format
         decoder_output = decoder_output.transpose(0, 1)  # (batch_size, tgt_len, embed_dim)
         
         # Project to vocabulary
@@ -128,8 +146,11 @@ class TransformerDecoder(nn.Module):
             device: Device to create mask on
             
         Returns:
-            mask: Causal attention mask (sz, sz)
+            mask: Causal attention mask (sz, sz) where -inf means masked positions
         """
+        # Create upper triangular mask (causal mask)
+        # Positions with value 1 (upper triangle) should be masked (set to -inf)
+        # Positions with value 0 (lower triangle including diagonal) can attend (set to 0)
         mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1)
         mask = mask.masked_fill(mask == 1, float('-inf'))
         return mask

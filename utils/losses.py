@@ -47,8 +47,9 @@ class CompositeLoss(nn.Module):
             loss: Cross-entropy loss
         """
         batch_size, seq_len, vocab_size = logits.shape
-        logits_flat = logits.view(-1, vocab_size)
-        targets_flat = targets.view(-1)
+        # Use reshape instead of view to handle non-contiguous tensors (e.g., from slicing)
+        logits_flat = logits.reshape(-1, vocab_size)
+        targets_flat = targets.reshape(-1)
         
         loss = self.ce_loss(logits_flat, targets_flat)
         return loss
