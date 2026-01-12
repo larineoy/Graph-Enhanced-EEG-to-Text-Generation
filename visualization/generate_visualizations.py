@@ -5,12 +5,16 @@ Generate visualizations from a trained model checkpoint
 
 import argparse
 import os
+import sys
 import torch
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
 from train import load_config, create_model
-from preprocessing import ZuCoDataset, collate_fn
+from preprocessing.preprocessing import ZuCoDataset, collate_fn
 from utils.visualization import save_adjacency_heatmap, visualize_strg_comprehensive
 
 
