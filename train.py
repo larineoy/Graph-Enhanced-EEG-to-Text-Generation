@@ -119,7 +119,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config):
             
             # Get text embeddings for contrastive loss (using frozen BERT)
             text_embeds = strg_output.get('text_embeds')  # (batch_size, graph_embed_dim) from frozen BERT
-            eeg_embeds = strg_output['stre_embeds'].squeeze(1).mean(dim=1)  # (batch_size, embed_dim)
+            # stre_embeds is (batch_size, 1, graph_embed_dim), squeeze to (batch_size, graph_embed_dim)
+            eeg_embeds = strg_output['stre_embeds'].squeeze(1)  # (batch_size, graph_embed_dim)
             
             loss, loss_dict = criterion(
                 logits=logits,
@@ -167,6 +168,9 @@ def validate(model, dataloader, criterion, device, tokenizer, config):
     total_loss = 0.0
     all_references = []
     all_candidates = []
+    
+    # Debug: Track predictions for printing
+    debug_predictions = []
     
     with torch.no_grad():
         for batch in tqdm(dataloader, desc='Validating'):
@@ -229,12 +233,21 @@ def validate(model, dataloader, criterion, device, tokenizer, config):
             for i in range(len(texts)):
                 ref = texts[i].split()
                 if hasattr(tokenizer, 'decode'):
-                    cand = tokenizer.decode(generated[i].cpu().tolist()).split()
+                    # CRITICAL FIX: Add skip_special_tokens=True to remove [CLS], [SEP], [PAD]
+                    cand = tokenizer.decode(generated[i].cpu().tolist(), skip_special_tokens=True).split()
+                    pred_text = ' '.join(cand)
                 else:
                     cand = [str(t.item()) for t in generated[i]]
+                    pred_text = ' '.join(cand)
                 
                 all_references.append(ref)
                 all_candidates.append(cand)
+                
+                # Debug: Store first few predictions for printing
+                if len(debug_predictions) < 5:
+                    ref_ids = text_tokens[i].cpu().tolist()[:30]
+                    pred_ids = generated[i].cpu().tolist()[:30]
+                    debug_predictions.append((ref_ids, pred_ids, texts[i], pred_text))
     
     avg_loss = total_loss / len(dataloader)
     
