@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from typing import Dict, Optional
+from transformers import AutoModel
 from .strg import STRG
 from .stre import STRE
 from .decoder import TransformerDecoder
@@ -110,14 +111,20 @@ class GraphEnhancedEEG2Text(nn.Module):
             max_decoder_length=max_decoder_length
         )
         
-        # Text encoder for contrastive loss
-        # Uses shared token embeddings with decoder, then aggregates to sentence-level embedding
-        self.text_encoder = nn.Sequential(
-            nn.Linear(decoder_embed_dim, decoder_embed_dim),
-            nn.ReLU(),
-            nn.Dropout(decoder_dropout),
-            nn.Linear(decoder_embed_dim, graph_embed_dim)  # Match graph_embed_dim for contrastive loss
-        )
+        # Text encoder for contrastive loss (FROZEN BERT)
+        # Use frozen pretrained BERT model for contrastive loss
+        self.frozen_text_model = AutoModel.from_pretrained('bert-base-uncased')
+        # Freeze all parameters in BERT
+        for param in self.frozen_text_model.parameters():
+            param.requires_grad = False
+        self.frozen_text_model.eval()  # Set to eval mode (disables dropout, etc.)
+        
+        # Project BERT embeddings (768-dim) to graph_embed_dim
+        bert_dim = 768
+        if bert_dim != graph_embed_dim:
+            self.text_proj = nn.Linear(bert_dim, graph_embed_dim)
+        else:
+            self.text_proj = nn.Identity()
     
     def set_electrode_positions(self, electrode_positions: torch.Tensor):
         """
@@ -139,7 +146,7 @@ class GraphEnhancedEEG2Text(nn.Module):
     
     def encode_text(self, text_tokens: torch.Tensor) -> torch.Tensor:
         """
-        Encode text tokens to embeddings for contrastive loss.
+        Encode text tokens using frozen BERT model for contrastive loss.
         
         Args:
             text_tokens: Token IDs of shape (batch_size, seq_len)
@@ -147,19 +154,14 @@ class GraphEnhancedEEG2Text(nn.Module):
         Returns:
             text_embeds: Sentence-level text embeddings of shape (batch_size, graph_embed_dim)
         """
-        # Get token embeddings from decoder (shared embeddings)
-        token_embeds = self.decoder.token_embedding(text_tokens)  # (batch_size, seq_len, decoder_embed_dim)
-        
-        # Average pool over sequence length (can also use attention pooling)
-        # Mask out padding tokens (assume pad_token_id = 0)
-        mask = (text_tokens != 0).float().unsqueeze(-1)  # (batch_size, seq_len, 1)
-        masked_embeds = token_embeds * mask  # (batch_size, seq_len, decoder_embed_dim)
-        seq_lengths = mask.sum(dim=1, keepdim=True)  # (batch_size, 1, 1)
-        seq_lengths = torch.clamp(seq_lengths, min=1.0)  # Avoid division by zero
-        avg_embeds = masked_embeds.sum(dim=1) / seq_lengths.squeeze(-1)  # (batch_size, decoder_embed_dim)
+        # Use frozen BERT model (no gradients)
+        with torch.no_grad():
+            outputs = self.frozen_text_model(text_tokens)
+            # Use [CLS] token (first token) for sentence-level representation
+            text_embeds = outputs.last_hidden_state[:, 0, :]  # (batch_size, 768)
         
         # Project to graph embedding dimension
-        text_embeds = self.text_encoder(avg_embeds)  # (batch_size, graph_embed_dim)
+        text_embeds = self.text_proj(text_embeds)  # (batch_size, graph_embed_dim)
         
         return text_embeds
     
