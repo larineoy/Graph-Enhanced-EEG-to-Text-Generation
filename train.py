@@ -117,9 +117,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config):
             # Shift for teacher forcing
             targets = text_tokens[:, 1:]
             
-            # Get text embeddings for contrastive loss (simplified)
-            # In practice, you'd use a pretrained text encoder
-            text_embeds = None
+            # Get text embeddings for contrastive loss (using frozen BERT)
+            text_embeds = strg_output.get('text_embeds')  # (batch_size, graph_embed_dim) from frozen BERT
             eeg_embeds = strg_output['stre_embeds'].squeeze(1).mean(dim=1)  # (batch_size, embed_dim)
             
             loss, loss_dict = criterion(
