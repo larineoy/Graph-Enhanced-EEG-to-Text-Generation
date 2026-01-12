@@ -299,7 +299,11 @@ class GraphEnhancedEEG2Text(nn.Module):
                 )
                 
                 # Get next token (greedy)
-                next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                # Mask out padding token to prevent generating it
+                logits_last = logits[:, -1, :].clone()  # (batch_size, vocab_size)
+                logits_last[:, pad_token_id] = float('-inf')  # Mask padding token
+                
+                next_token = logits_last.argmax(dim=-1, keepdim=True)
                 generated = torch.cat([generated, next_token], dim=1)
                 
                 # Check if all sequences have reached EOS
