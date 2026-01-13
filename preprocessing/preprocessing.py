@@ -79,17 +79,31 @@ class ZuCoDataset(Dataset):
         self.detect_bad_channels = detect_bad_channels
         self.bad_channel_threshold = bad_channel_threshold
         
-        # Detect ZuCo version if not specified
-        # Extract channel count from actual ZuCo data (not hardcoded)
+        # Detect ZuCo versions available
+        # Support loading from both ZuCo 1.0 and ZuCo 2.0
         self.num_channels = None  # Will be determined from data
+        self.versions_to_load = []
+        
         if version is None:
+            # Auto-detect: load both versions if available
             if os.path.exists(os.path.join(data_dir, 'ZuCo_1.0')):
-                version = '1.0'
-            elif os.path.exists(os.path.join(data_dir, 'ZuCo_2.0')):
-                version = '2.0'
-            else:
-                raise ValueError(f"Could not detect ZuCo version in {data_dir}")
-        self.version = version
+                self.versions_to_load.append('1.0')
+            if os.path.exists(os.path.join(data_dir, 'ZuCo_2.0')):
+                self.versions_to_load.append('2.0')
+            
+            if len(self.versions_to_load) == 0:
+                raise ValueError(f"Could not detect ZuCo version in {data_dir}. Expected ZuCo_1.0/ or ZuCo_2.0/")
+            
+            # For backward compatibility, set version to first available
+            self.version = self.versions_to_load[0]
+        else:
+            # Specific version requested
+            if version not in ['1.0', '2.0']:
+                raise ValueError(f"Invalid version: {version}. Must be '1.0' or '2.0'")
+            if not os.path.exists(os.path.join(data_dir, f'ZuCo_{version}')):
+                raise ValueError(f"ZuCo {version} not found in {data_dir}")
+            self.versions_to_load = [version]
+            self.version = version
         
         # Load all aligned samples with progress tracking
         print(f"  Loading EEG files and aligning with text (this may take 2-10 minutes)...")
@@ -99,18 +113,32 @@ class ZuCoDataset(Dataset):
         
         # Extract actual number of channels and electrode positions from ZuCo data (not hardcoded)
         if len(self.samples) > 0:
-            # Get channel count from first sample's EEG data
-            first_sample = self.samples[0]
-            if 'eeg_raw' in first_sample:
-                eeg_shape = first_sample['eeg_raw'].shape
-                if len(eeg_shape) == 2:  # (channels, time)
-                    detected_channels = eeg_shape[0]
-                    self.num_channels = detected_channels
-                    print(f"  ✓ Detected {detected_channels} channels from ZuCo data")
+            # Check channel counts across all samples (important when loading multiple versions)
+            channel_counts = {}
+            for sample in self.samples:
+                if 'eeg_raw' in sample:
+                    eeg_shape = sample['eeg_raw'].shape
+                    if len(eeg_shape) == 2:  # (channels, time)
+                        num_ch = eeg_shape[0]
+                        channel_counts[num_ch] = channel_counts.get(num_ch, 0) + 1
+                    else:
+                        raise ValueError(f"Unexpected EEG shape: {eeg_shape}. Expected (channels, time)")
                 else:
-                    raise ValueError(f"Unexpected EEG shape: {eeg_shape}. Expected (channels, time)")
+                    raise ValueError("No 'eeg_raw' found in samples")
+            
+            # Use most common channel count
+            if channel_counts:
+                detected_channels = max(channel_counts, key=channel_counts.get)
+                self.num_channels = detected_channels
+                print(f"  ✓ Detected {detected_channels} channels from ZuCo data")
+                
+                # Warn if there are multiple channel counts (might indicate version mismatch)
+                if len(channel_counts) > 1:
+                    print(f"  ⚠️  WARNING: Multiple channel counts detected: {channel_counts}")
+                    print(f"  ⚠️  Using most common: {detected_channels} channels ({channel_counts[detected_channels]} samples)")
+                    print(f"  ⚠️  Samples with different channel counts will need to be handled separately")
             else:
-                raise ValueError("No 'eeg_raw' found in samples")
+                raise ValueError("Could not determine channel count from samples")
             
             # Extract electrode positions from first sample if available (from ZuCo chanlocs)
             if 'channel_info' in first_sample and 'electrode_positions' in first_sample['channel_info']:
@@ -126,23 +154,36 @@ class ZuCoDataset(Dataset):
         if split != 'all':
             self.samples = self._split_data(self.samples)
         
-        print(f"  ✓ Loaded {len(self.samples)} samples from ZuCo {version} ({split} split) in {load_time:.1f} seconds")
+        # Format version string for display
+        if len(self.versions_to_load) > 1:
+            version_str = f"{'+'.join(self.versions_to_load)}"
+        else:
+            version_str = self.version
+        
+        print(f"  ✓ Loaded {len(self.samples)} samples from ZuCo {version_str} ({split} split) in {load_time:.1f} seconds")
     
     def _load_aligned_samples(self) -> List[Dict]:
         """
         Load EEG-text pairs with sentence-level alignment using wordbounds
         Returns list of dictionaries with aligned samples
+        Supports loading from both ZuCo 1.0 and ZuCo 2.0
         """
         all_samples = []
         
-        # Determine base path based on version
-        if self.version == '1.0':
-            base_path = os.path.join(self.data_dir, 'ZuCo_1.0')
-            all_samples.extend(self._load_zuco_v1_samples(base_path))
-        elif self.version == '2.0':
-            base_path = os.path.join(self.data_dir, 'ZuCo_2.0')
-            all_samples.extend(self._load_zuco_v2_samples(base_path))
+        # Load samples from all specified versions
+        for version in self.versions_to_load:
+            if version == '1.0':
+                base_path = os.path.join(self.data_dir, 'ZuCo_1.0')
+                samples_v1 = self._load_zuco_v1_samples(base_path)
+                all_samples.extend(samples_v1)
+                print(f"    ✓ Loaded {len(samples_v1)} samples from ZuCo 1.0")
+            elif version == '2.0':
+                base_path = os.path.join(self.data_dir, 'ZuCo_2.0')
+                samples_v2 = self._load_zuco_v2_samples(base_path)
+                all_samples.extend(samples_v2)
+                print(f"    ✓ Loaded {len(samples_v2)} samples from ZuCo 2.0")
         
+        print(f"    ✓ Total samples loaded: {len(all_samples)} (from {len(self.versions_to_load)} version(s))")
         return all_samples
     
     def _load_zuco_v1_samples(self, base_path: str) -> List[Dict]:
