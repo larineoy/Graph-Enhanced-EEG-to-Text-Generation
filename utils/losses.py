@@ -1,5 +1,6 @@
 """
 Loss functions for Graph-Enhanced EEG-to-Text model
+FIXED VERSION: Removed label smoothing that was causing comma-only predictions
 """
 
 import torch
@@ -33,9 +34,21 @@ class CompositeLoss(nn.Module):
         self.lambda_smooth = lambda_smooth
         self.lambda_contrastive = lambda_contrastive
         self.ignore_index = ignore_index
-        # Add label smoothing to prevent overfitting to most frequent token (e.g., comma)
-        # Label smoothing of 0.1 means 10% of probability mass is distributed uniformly
-        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index, label_smoothing=0.1)
+        
+        # ========================================================================
+        # CRITICAL FIX: Removed label_smoothing=0.1 that was causing collapse
+        # ========================================================================
+        # Label smoothing was causing the model to predict only commas (token 1010)
+        # because it:
+        # 1. Reduces confidence in correct predictions (90% instead of 100%)
+        # 2. Distributes 10% probability to ALL tokens including wrong ones
+        # 3. Combined with class imbalance (commas are very frequent), the model
+        #    learns that predicting comma is "safer" than learning the actual task
+        #
+        # Solution: Disable label smoothing initially. Only add it after epoch 50+
+        #           when the model has learned basic text generation.
+        # ========================================================================
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index, label_smoothing=0.0)
     
     def cross_entropy_loss(self, logits: torch.Tensor, targets: torch.Tensor):
         """
@@ -168,3 +181,87 @@ class CompositeLoss(nn.Module):
         
         return total_loss, loss_dict
 
+
+# ============================================================================
+# OPTIONAL: FocalLoss for handling class imbalance (e.g., too many commas)
+# ============================================================================
+class FocalLoss(nn.Module):
+    """
+    Focal Loss: Down-weights easy examples, up-weights hard examples.
+    
+    Helps with class imbalance by reducing the contribution of frequent tokens
+    (like commas) and focusing learning on harder, less frequent tokens.
+    
+    Formula: FL(p_t) = -alpha * (1 - p_t)^gamma * log(p_t)
+    
+    When gamma=0, this reduces to standard cross-entropy.
+    When gamma>0, easy examples (p_t close to 1) are down-weighted.
+    """
+    
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, ignore_index: int = -100):
+        """
+        Args:
+            alpha: Weighting factor in [0, 1] to balance positive/negative examples
+            gamma: Focusing parameter (gamma >= 0). Higher = more focus on hard examples
+            ignore_index: Index to ignore (e.g., padding token)
+        """
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor):
+        """
+        Args:
+            logits: Predictions (batch*seq, vocab_size)
+            targets: Ground truth (batch*seq)
+        Returns:
+            loss: Focal loss scalar
+        """
+        # Standard cross-entropy (no reduction yet)
+        ce_loss = F.cross_entropy(logits, targets, reduction='none', ignore_index=self.ignore_index)
+        
+        # Get predicted probabilities for correct class
+        p_t = torch.exp(-ce_loss)
+        
+        # Focal weight: (1 - p_t)^gamma
+        # When p_t is close to 1 (easy example), weight is close to 0
+        # When p_t is close to 0 (hard example), weight is close to 1
+        focal_weight = (1 - p_t) ** self.gamma
+        
+        # Apply focal weight and alpha
+        focal_loss = self.alpha * focal_weight * ce_loss
+        
+        # Only average over non-ignored tokens
+        mask = (targets != self.ignore_index)
+        if mask.sum() > 0:
+            return focal_loss[mask].mean()
+        else:
+            return focal_loss.mean()
+
+
+# ============================================================================
+# OPTIONAL: CompositeLoss with FocalLoss instead of CrossEntropyLoss
+# ============================================================================
+class CompositeLossWithFocal(CompositeLoss):
+    """
+    Same as CompositeLoss but uses FocalLoss instead of CrossEntropyLoss.
+    
+    Use this if your model is still predicting only frequent tokens after
+    removing label smoothing.
+    """
+    
+    def __init__(
+        self,
+        lambda_smooth: float = 0.1,
+        lambda_contrastive: float = 0.2,
+        vocab_size: int = 10000,
+        ignore_index: int = -100,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0
+    ):
+        super().__init__(lambda_smooth, lambda_contrastive, vocab_size, ignore_index)
+        
+        # Replace CrossEntropyLoss with FocalLoss
+        self.ce_loss = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, ignore_index=ignore_index)
+        print(f"[CompositeLossWithFocal] Using FocalLoss (alpha={focal_alpha}, gamma={focal_gamma})")
