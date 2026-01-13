@@ -281,6 +281,18 @@ class GraphEnhancedEEG2Text(nn.Module):
         # Get STRE embeddings (memory)
         memory, _ = self.forward(eeg_bands)
         
+        # DIAGNOSTIC: Check memory (STRE embeddings)
+        if batch_size == 1:
+            memory_norm = torch.norm(memory[0]).item()
+            memory_std = memory[0].std().item()
+            print(f"\n[GEN DEBUG] Memory (STRE embeddings):")
+            print(f"  Memory norm: {memory_norm:.4f}")
+            print(f"  Memory std: {memory_std:.4f}")
+            if memory_norm < 1e-6:
+                print(f"  ⚠️  WARNING: Memory is near zero! Model can't generate meaningful text.")
+            if memory_std < 1e-6:
+                print(f"  ⚠️  WARNING: Memory is constant! Model can't generate diverse text.")
+        
         # Simple greedy generation (can be extended to beam search)
         generated = torch.full(
             (batch_size, 1),
@@ -290,7 +302,10 @@ class GraphEnhancedEEG2Text(nn.Module):
         )
         
         with torch.no_grad():
-            for _ in range(max_length - 1):
+            # Track which sequences have finished (reached EOS)
+            finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            
+            for step in range(max_length - 1):
                 tgt_mask = self.decoder.generate_mask(generated.shape[1], device)
                 logits = self.decoder(
                     tgt=generated,
@@ -299,15 +314,33 @@ class GraphEnhancedEEG2Text(nn.Module):
                 )
                 
                 # Get next token (greedy)
-                # Mask out padding token to prevent generating it
+                # Mask out padding token to prevent generating it (from step 1 onwards)
                 logits_last = logits[:, -1, :].clone()  # (batch_size, vocab_size)
                 logits_last[:, pad_token_id] = float('-inf')  # Mask padding token
                 
+                # DIAGNOSTIC: Check logits (first batch, first few steps only)
+                if step < 3 and batch_size == 1:
+                    top5_logits, top5_indices = torch.topk(logits_last[0], 5)
+                    print(f"\n[GEN DEBUG] Step {step}:")
+                    print(f"  Logits range: [{logits_last[0].min().item():.2f}, {logits_last[0].max().item():.2f}]")
+                    print(f"  Logits std: {logits_last[0].std().item():.2f}")
+                    print(f"  Top 5 token IDs: {top5_indices.tolist()}")
+                    print(f"  Top 5 logits: {top5_logits.tolist()}")
+                    # Check if all logits are similar (degenerate)
+                    if logits_last[0].std().item() < 0.1:
+                        print(f"  ⚠️  WARNING: Logits are too uniform (std={logits_last[0].std().item():.2f})!")
+                
+                # For finished sequences, keep generating EOS
                 next_token = logits_last.argmax(dim=-1, keepdim=True)
+                next_token[finished] = eos_token_id
+                
                 generated = torch.cat([generated, next_token], dim=1)
                 
-                # Check if all sequences have reached EOS
-                if (next_token == eos_token_id).all():
+                # Mark sequences that just generated EOS
+                finished = finished | (next_token.squeeze(1) == eos_token_id)
+                
+                # Stop if all sequences have reached EOS
+                if finished.all():
                     break
         
         return generated

@@ -77,6 +77,11 @@ class TransformerDecoder(nn.Module):
         # Output projection
         self.output_proj = nn.Linear(embed_dim, vocab_size)
         
+        # Initialize output projection with small weights to prevent degenerate predictions
+        # This helps prevent the model from always predicting the same token (e.g., comma)
+        nn.init.normal_(self.output_proj.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.output_proj.bias)
+        
         self.dropout = nn.Dropout(dropout)
     
     def forward(

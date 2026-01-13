@@ -113,6 +113,25 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config):
             # Forward pass
             logits, strg_output = model(eeg_bands, text_tokens)
             
+            # DIAGNOSTIC: Check if logits are reasonable (not all zeros or NaNs)
+            if batch_idx == 0:  # Only check first batch of first epoch
+                with torch.no_grad():
+                    logits_sample = logits[0, 0, :].cpu()  # First sample, first position
+                    logits_max = logits_sample.max().item()
+                    logits_min = logits_sample.min().item()
+                    logits_std = logits_sample.std().item()
+                    logits_top5 = torch.topk(logits_sample, 5).indices.tolist()
+                    print(f"\n[DEBUG] First batch logits check:")
+                    print(f"  Logits range: [{logits_min:.2f}, {logits_max:.2f}], std: {logits_std:.2f}")
+                    print(f"  Top 5 token IDs: {logits_top5}")
+                    
+                    # Check EEG embeddings
+                    eeg_embeds_check = strg_output['stre_embeds'].squeeze(1)[0].cpu()
+                    eeg_norm = torch.norm(eeg_embeds_check).item()
+                    print(f"  EEG embedding norm: {eeg_norm:.4f}")
+                    if eeg_norm < 1e-6:
+                        print(f"  ⚠️  WARNING: EEG embeddings are near zero! This will cause poor predictions.")
+            
             # Compute loss
             # Shift for teacher forcing
             targets = text_tokens[:, 1:]
@@ -134,6 +153,28 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config):
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
+            
+            # DIAGNOSTIC: Check gradients (first batch only)
+            if batch_idx == 0:
+                total_grad_norm = 0.0
+                param_count = 0
+                zero_grad_count = 0
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        param_grad_norm = param.grad.norm().item()
+                        total_grad_norm += param_grad_norm
+                        param_count += 1
+                        if param_grad_norm < 1e-8:
+                            zero_grad_count += 1
+                    else:
+                        zero_grad_count += 1
+                if param_count > 0:
+                    avg_grad_norm = total_grad_norm / param_count
+                    print(f"  Gradient check: avg_norm={avg_grad_norm:.6f}, zero_grad_params={zero_grad_count}")
+                    if avg_grad_norm < 1e-6:
+                        print(f"  ⚠️  WARNING: Gradients are very small! Model may not be learning.")
+                else:
+                    print(f"  ⚠️  WARNING: No gradients found!")
             
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['gradient_clip'])
@@ -424,13 +465,24 @@ def main():
     )
     print(f"  ✓ Optimizer: AdamW (lr={config['training']['learning_rate']})")
     
+    # Get pad_token_id for loss function (must ignore padding tokens in loss)
+    pad_token_id = tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') and tokenizer.pad_token_id is not None else 0
+    
     # Create loss function
     criterion = CompositeLoss(
         lambda_smooth=config['training']['lambda_smooth'],
         lambda_contrastive=config['training']['lambda_contrastive'],
-        vocab_size=config['model']['decoder']['vocab_size']
+        vocab_size=config['model']['decoder']['vocab_size'],
+        ignore_index=pad_token_id  # CRITICAL: Ignore padding tokens (0) in loss calculation
     )
+    # Verify ignore_index is correctly set (CRITICAL DEBUG CHECK)
     print(f"  ✓ Loss function: Composite (λ_smooth={config['training']['lambda_smooth']}, λ_contrastive={config['training']['lambda_contrastive']})")
+    print(f"  ✓ CE ignore_index = {criterion.ce_loss.ignore_index}")
+    print(f"  ✓ pad_token_id = {pad_token_id}")
+    if criterion.ce_loss.ignore_index != pad_token_id:
+        print(f"  ⚠️  WARNING: ignore_index mismatch! This will cause training issues!")
+    else:
+        print(f"  ✓ ignore_index matches pad_token_id - padding tokens will be ignored in loss")
     
     # Resume from checkpoint if provided
     start_epoch = 0
