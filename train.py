@@ -7,7 +7,7 @@ import yaml
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from transformers import AutoTokenizer
 import os
 import json
@@ -113,8 +113,26 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config, tokeniz
             eeg_bands = {band_name: band_tensor.to(device) for band_name, band_tensor in batch['eeg_bands'].items()}
             text_tokens = batch['text_tokens'].to(device)
             
+            # CRITICAL FIX: Explicit decoder input/target alignment
+            # decoder_input = text_tokens[:, :-1]  # Teacher forcing input (model does this internally)
+            # targets = text_tokens[:, 1:]         # Next token labels
+            # Note: Model forward() handles the shift internally, but we need to pass full text_tokens
+            
+            # Create padding mask for decoder input (CRITICAL: prevent attention to padding)
+            decoder_input = text_tokens[:, :-1]  # For padding mask calculation
+            pad_token_id = pad_token_id if pad_token_id is not None else 0
+            tgt_key_padding_mask = (decoder_input == pad_token_id)  # (batch_size, tgt_len-1), True where PAD
+            
             # Forward pass
-            logits, strg_output = model(eeg_bands, text_tokens)
+            logits, strg_output = model(eeg_bands, text_tokens, tgt_key_padding_mask=tgt_key_padding_mask)
+            
+            # Ensure logits length matches targets (safety check)
+            targets = text_tokens[:, 1:]  # Next token labels
+            if logits.shape[1] != targets.shape[1]:
+                # Truncate or pad logits to match targets
+                min_len = min(logits.shape[1], targets.shape[1])
+                logits = logits[:, :min_len, :]
+                targets = targets[:, :min_len]
             
             # DIAGNOSTIC: Check if logits are reasonable (not all zeros or NaNs)
             if batch_idx == 0 and not hasattr(train_epoch, first_batch_key):  # Only check first batch of each epoch
@@ -144,8 +162,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config, tokeniz
                         print(f"  ⚠️  WARNING: EEG embeddings are near zero! This will cause poor predictions.")
             
             # Compute loss
-            # Shift for teacher forcing
-            targets = text_tokens[:, 1:]
+            # Targets already computed above (text_tokens[:, 1:])
             
             # DIAGNOSTIC: Check targets (first batch only, first epoch only)
             if batch_idx == 0 and epoch == 0 and tokenizer is not None:
@@ -160,11 +177,28 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config, tokeniz
                     print(f"\n[DEBUG] Target tokens analysis (first batch, epoch {epoch}):")
                     print(f"  Total target tokens: {len(targets_flat)}")
                     print(f"  Unique tokens: {len(unique_tokens)}")
+                    
+                    # Print raw text and tokens for verification
+                    if len(batch['text']) > 0:
+                        print(f"  RAW TEXT (first sample): {batch['text'][0][:100]}...")
+                        print(f"  TOKENS (first 50): {tokenizer.convert_ids_to_tokens(text_tokens[0][:50].tolist())}")
+                    
                     print(f"  Top 10 most frequent target tokens:")
                     for i, (token_id, count) in enumerate(zip(top10_tokens, top10_counts)):
                         token_str = tokenizer.decode([token_id.item()])
                         pct = (count.item() / len(targets_flat)) * 100
                         print(f"    {i+1}. ID={token_id.item():5d}, count={count.item():4d} ({pct:5.1f}%), token='{token_str}'")
+                    
+                    # Check if comma is dominating
+                    comma_id = tokenizer.convert_tokens_to_ids(',')
+                    if comma_id in unique_tokens:
+                        comma_idx = (unique_tokens == comma_id).nonzero(as_tuple=True)[0]
+                        if len(comma_idx) > 0:
+                            comma_count = counts[comma_idx[0]].item()
+                            comma_pct = (comma_count / len(targets_flat)) * 100
+                            print(f"  Comma token (ID={comma_id}): {comma_count}/{len(targets_flat)} ({comma_pct:.1f}%)")
+                            if comma_pct > 30:
+                                print(f"  ⚠️  WARNING: Comma is >30% of targets! This might cause model to predict only commas.")
                     
                     # Check if targets are mostly padding
                     pad_count = (targets_flat == pad_token_id).sum().item()
@@ -284,42 +318,33 @@ def validate(model, dataloader, criterion, device, tokenizer, config):
             text_tokens = batch['text_tokens'].to(device)
             texts = batch['text']
             
+            # CRITICAL FIX: Explicit decoder input/target alignment
+            decoder_input = text_tokens[:, :-1]  # Teacher forcing input
+            targets = text_tokens[:, 1:]         # Next token labels
+            
+            # Create padding mask for decoder input (CRITICAL: prevent attention to padding)
+            pad_token_id_val = tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') and tokenizer.pad_token_id is not None else 0
+            tgt_key_padding_mask = (decoder_input == pad_token_id_val)  # (batch_size, tgt_len-1), True where PAD
+            
             # Forward pass
-            logits, strg_output = model(eeg_bands, text_tokens)
+            logits, strg_output = model(eeg_bands, text_tokens, tgt_key_padding_mask=tgt_key_padding_mask)
+            
+            # Ensure logits length matches targets (safety check)
+            if logits.shape[1] != targets.shape[1]:
+                min_len = min(logits.shape[1], targets.shape[1])
+                logits = logits[:, :min_len, :]
+                targets = targets[:, :min_len]
             
             # Compute loss
-            targets = text_tokens[:, 1:]
             loss, _ = criterion(logits=logits, targets=targets)
             total_loss += loss.item()
             
             # Generate predictions
-            # BERT uses [CLS] (101) and [SEP] (102) as special tokens
-            # Get token IDs - BERT doesn't have bos_token_id/eos_token_id attributes
+            # CRITICAL FIX: Use tokenizer attributes directly (don't guess IDs)
             if tokenizer is not None:
-                try:
-                    # Use convert_tokens_to_ids for reliable token ID conversion
-                    if hasattr(tokenizer, 'cls_token') and tokenizer.cls_token:
-                        cls_id = tokenizer.convert_tokens_to_ids(tokenizer.cls_token)
-                        bos_token_id = cls_id[0] if isinstance(cls_id, list) else cls_id
-                    else:
-                        bos_token_id = 101  # Default [CLS] token ID for BERT
-                    
-                    if hasattr(tokenizer, 'sep_token') and tokenizer.sep_token:
-                        sep_id = tokenizer.convert_tokens_to_ids(tokenizer.sep_token)
-                        eos_token_id = sep_id[0] if isinstance(sep_id, list) else sep_id
-                    else:
-                        eos_token_id = 102  # Default [SEP] token ID for BERT
-                    
-                    if hasattr(tokenizer, 'pad_token') and tokenizer.pad_token:
-                        pad_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
-                        pad_token_id = pad_id[0] if isinstance(pad_id, list) else pad_id
-                    else:
-                        pad_token_id = 0  # Default [PAD] token ID for BERT
-                except (AttributeError, KeyError):
-                    # Fallback to default BERT token IDs
-                    bos_token_id = 101  # [CLS]
-                    eos_token_id = 102  # [SEP]
-                    pad_token_id = 0    # [PAD]
+                bos_token_id = tokenizer.cls_token_id  # [CLS] for BERT
+                eos_token_id = tokenizer.sep_token_id  # [SEP] for BERT
+                pad_token_id = tokenizer.pad_token_id  # [PAD] for BERT
             else:
                 # Fallback values if tokenizer not available
                 bos_token_id = 101  # [CLS] token ID for BERT
@@ -420,15 +445,17 @@ def main():
     print("\n[STAGE 3/7] Initializing tokenizer...")
     # Create tokenizer
     try:
-        tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased', use_fast=True)
+        # CRITICAL FIX: Do NOT override pad_token for BERT - it should already be [PAD]
+        # BERT doesn't have eos_token in the same sense as GPT models
+        assert tokenizer.pad_token_id is not None, "BERT tokenizer should have pad_token_id"
         # Get actual vocabulary size from tokenizer (BERT-base-uncased has 30522 tokens)
         actual_vocab_size = getattr(tokenizer, 'vocab_size', len(tokenizer))
         # Update config to use tokenizer's vocab size for decoder
         config['model']['decoder']['vocab_size'] = actual_vocab_size
         config['data']['vocab_size'] = actual_vocab_size
         print(f"  ✓ BERT tokenizer loaded successfully (vocab_size={actual_vocab_size})")
+        print(f"  ✓ pad_token_id={tokenizer.pad_token_id}, cls_token_id={tokenizer.cls_token_id}, sep_token_id={tokenizer.sep_token_id}")
     except Exception as e:
         print(f"  ⚠ Warning: Could not load tokenizer: {e}")
         print("  ⚠ Using simple tokenizer with config vocab_size")
@@ -436,6 +463,12 @@ def main():
     
     print("\n[STAGE 4/7] Loading and preprocessing datasets...")
     print("  This may take a few minutes (loading EEG files, applying filters, extracting frequency bands)...")
+    
+    # SANITY TEST MODE: Train on 32 samples only to verify pipeline works
+    # Set sanity_test: true in config to enable this (catches 80% of hidden bugs)
+    sanity_test_mode = config.get('sanity_test', False)
+    if sanity_test_mode:
+        print("  ⚠️  SANITY TEST MODE: Training on 32 samples only to verify pipeline")
     
     # Create datasets with artifact removal settings from config
     data_config = config['data']
@@ -461,6 +494,11 @@ def main():
         detect_bad_channels=data_config.get('detect_bad_channels', False),
         bad_channel_threshold=data_config.get('bad_channel_threshold', 3.0)
     )
+    
+    # Apply sanity test subset if enabled
+    if sanity_test_mode:
+        train_dataset = Subset(train_dataset, range(min(32, len(train_dataset))))
+        print(f"  ⚠️  SANITY TEST: Using only {len(train_dataset)} samples for training")
     
     print(f"  ✓ Train dataset: {len(train_dataset)} samples")
     print(f"  ✓ Validation dataset: {len(val_dataset)} samples")
