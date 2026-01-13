@@ -218,6 +218,20 @@ def main():
     comma_count = pred_text.count(',')
     print(f"Comma count: {comma_count} out of {len(pred_text)} characters")
     
+    # Check for repetitive predictions (any token repeated many times)
+    pred_tokens = pred_text.split()
+    repetition_ratio = 0.0
+    most_common_token = ""
+    if len(pred_tokens) > 0:
+        most_common_token = max(set(pred_tokens), key=pred_tokens.count)
+        most_common_count = pred_tokens.count(most_common_token)
+        repetition_ratio = most_common_count / len(pred_tokens)
+        print(f"Most repeated token: '{most_common_token}' ({most_common_count}/{len(pred_tokens)} = {repetition_ratio:.1%})")
+        
+        if repetition_ratio > 0.5:
+            print(f"\n⚠️  WARNING: Prediction is mostly repetitive ('{most_common_token}')!")
+            print("  This indicates the model is untrained or logits are degenerate.")
+    
     if comma_count > len(pred_text) * 0.5:
         print("\n⚠️  WARNING: Prediction is mostly commas!")
         print("  This indicates the model is untrained or logits are degenerate.")
@@ -234,13 +248,20 @@ def main():
         print("❌ ISSUE: STRE embeddings are near zero")
         print("   → STRG/STRE modules are not working")
         print("   → Solution: Check STRG/STRE initialization and forward pass")
+    elif len(pred_tokens) > 0 and repetition_ratio > 0.5:
+        print("❌ ISSUE: Model predicts repetitive tokens")
+        print(f"   → Model keeps predicting '{most_common_token}' repeatedly")
+        print("   → This is normal for an untrained model")
+        print("   → Solution: Train the model - it will learn to predict diverse tokens")
     elif comma_count > len(pred_text) * 0.5:
         print("❌ ISSUE: Model predicts mostly commas")
         print("   → Model is untrained (most likely)")
         print("   → Solution: Train the model with proper loss function")
     else:
         print("✅ No obvious issues detected")
-        print("   → Model might be working, but needs training")
+        print("   → Model architecture is working correctly")
+        print("   → Model needs training to learn meaningful predictions")
+        print("   → Run: python train.py --config config/config.yaml --data_dir data")
 
 if __name__ == '__main__':
     import os
