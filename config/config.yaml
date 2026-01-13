@@ -6,7 +6,7 @@ data:
   train_split: 0.8
   val_split: 0.1
   test_split: 0.1
-  max_seq_length: 128
+  max_seq_length: 32
   vocab_size: 10000
   
   # Artifact removal settings
@@ -57,20 +57,25 @@ model:
 
 # Training
 training:
+  learning_rate: 5.0e-4  # Increase from 1e-4
+  early_stopping: false  # Disable it
+  num_epochs: 100  # Train longer
+  
+training:
   batch_size: 16
-  num_epochs: 50
-  learning_rate: 1e-4
+  num_epochs: 100  # Train longer
+  learning_rate: 5.0e-4  # Increase from 1e-4
   weight_decay: 1e-5
   warmup_steps: 1000
   gradient_clip: 1.0
   
   # Loss weights
   lambda_smooth: 0.1  # Graph smoothness regularization
-  lambda_contrastive: 0.2  # Contrastive alignment loss
+  lambda_contrastive: 0.0  # Contrastive alignment loss (DISABLED initially - enable after CE learns words)
   
   # Overfitting control
   dropout: 0.1  # Applied in model layers
-  early_stopping: true
+  early_stopping: false  # Disable it
   early_stopping_patience: 5  # Stop if no improvement for N epochs
   early_stopping_min_delta: 0.001
   
