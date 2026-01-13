@@ -169,7 +169,8 @@ class GraphEnhancedEEG2Text(nn.Module):
         self,
         eeg_bands: Dict[str, torch.Tensor],
         tgt_tokens: Optional[torch.Tensor] = None,
-        tgt_mask: Optional[torch.Tensor] = None
+        tgt_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None
     ):
         """
         Forward pass
@@ -213,7 +214,7 @@ class GraphEnhancedEEG2Text(nn.Module):
         if tgt_tokens is not None:
             # Training mode
             # Shift tokens for teacher forcing
-            tgt_input = tgt_tokens[:, :-1]  # Remove last token
+            tgt_input = tgt_tokens[:, :-1]  # Remove last token (decoder input)
             # tgt_output = tgt_tokens[:, 1:]  # For reference (targets in loss)
             
             # Generate causal mask
@@ -221,10 +222,17 @@ class GraphEnhancedEEG2Text(nn.Module):
                 tgt_len = tgt_input.shape[1]
                 tgt_mask = self.decoder.generate_mask(tgt_len, self.device)
             
+            # Create padding mask for decoder input (CRITICAL: prevent attention to padding)
+            if tgt_key_padding_mask is None:
+                # Create mask: True where token is PAD (should be masked)
+                pad_token_id = 0  # BERT pad_token_id
+                tgt_key_padding_mask = (tgt_input == pad_token_id)  # (batch_size, tgt_len)
+            
             logits = self.decoder(
                 tgt=tgt_input,
                 memory=memory,
-                tgt_mask=tgt_mask
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask
             )
             # logits: (batch_size, tgt_len-1, vocab_size)
             
@@ -305,6 +313,10 @@ class GraphEnhancedEEG2Text(nn.Module):
             # Track which sequences have finished (reached EOS)
             finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
             
+            # Repetition penalty: track last N tokens to prevent immediate repeats
+            last_tokens = []  # Track last few tokens per sequence
+            repetition_penalty = 1.2  # Penalize repeated tokens
+            
             for step in range(max_length - 1):
                 tgt_mask = self.decoder.generate_mask(generated.shape[1], device)
                 logits = self.decoder(
@@ -317,6 +329,15 @@ class GraphEnhancedEEG2Text(nn.Module):
                 # Mask out padding token to prevent generating it (from step 1 onwards)
                 logits_last = logits[:, -1, :].clone()  # (batch_size, vocab_size)
                 logits_last[:, pad_token_id] = float('-inf')  # Mask padding token
+                
+                # Apply repetition penalty (simple: penalize if same token appears in last 3 positions)
+                if step > 0 and len(last_tokens) > 0:
+                    for b in range(batch_size):
+                        if len(last_tokens[b]) >= 2:
+                            # If last token repeats, apply penalty
+                            last_token = last_tokens[b][-1]
+                            if logits_last[b, last_token] > float('-inf'):
+                                logits_last[b, last_token] = logits_last[b, last_token] / repetition_penalty
                 
                 # DIAGNOSTIC: Check logits (first batch, first few steps only)
                 if step < 3 and batch_size == 1:
@@ -335,6 +356,15 @@ class GraphEnhancedEEG2Text(nn.Module):
                 next_token[finished] = eos_token_id
                 
                 generated = torch.cat([generated, next_token], dim=1)
+                
+                # Update last tokens tracking
+                if len(last_tokens) < batch_size:
+                    last_tokens = [[] for _ in range(batch_size)]
+                for b in range(batch_size):
+                    token_val = next_token[b, 0].item()
+                    last_tokens[b].append(token_val)
+                    if len(last_tokens[b]) > 3:  # Keep only last 3 tokens
+                        last_tokens[b] = last_tokens[b][-3:]
                 
                 # Mark sequences that just generated EOS
                 finished = finished | (next_token.squeeze(1) == eos_token_id)
