@@ -97,11 +97,14 @@ def create_model(config, device):
     return model
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, config):
+def train_epoch(model, dataloader, optimizer, criterion, device, config, tokenizer=None, pad_token_id=0, epoch=0):
     """Train for one epoch"""
     model.train()
     total_loss = 0.0
     loss_history = []
+    
+    # Track first batch check per epoch
+    first_batch_key = f'_first_batch_epoch_{epoch}'
     
     pbar = tqdm(dataloader, desc='Training')
     for batch_idx, batch in enumerate(pbar):
@@ -114,16 +117,24 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config):
             logits, strg_output = model(eeg_bands, text_tokens)
             
             # DIAGNOSTIC: Check if logits are reasonable (not all zeros or NaNs)
-            if batch_idx == 0:  # Only check first batch of first epoch
+            if batch_idx == 0 and not hasattr(train_epoch, first_batch_key):  # Only check first batch of each epoch
+                setattr(train_epoch, first_batch_key, True)
                 with torch.no_grad():
                     logits_sample = logits[0, 0, :].cpu()  # First sample, first position
                     logits_max = logits_sample.max().item()
                     logits_min = logits_sample.min().item()
                     logits_std = logits_sample.std().item()
                     logits_top5 = torch.topk(logits_sample, 5).indices.tolist()
-                    print(f"\n[DEBUG] First batch logits check:")
+                    print(f"\n[DEBUG Epoch {epoch}] First batch logits check:")
                     print(f"  Logits range: [{logits_min:.2f}, {logits_max:.2f}], std: {logits_std:.2f}")
                     print(f"  Top 5 token IDs: {logits_top5}")
+                    
+                    # Decode top tokens
+                    if tokenizer is not None:
+                        print(f"  Top 5 tokens:")
+                        for idx, token_id in enumerate(logits_top5):
+                            token_str = tokenizer.decode([token_id])
+                            print(f"    {idx+1}. ID={token_id}, token='{token_str}'")
                     
                     # Check EEG embeddings
                     eeg_embeds_check = strg_output['stre_embeds'].squeeze(1)[0].cpu()
@@ -135,6 +146,59 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config):
             # Compute loss
             # Shift for teacher forcing
             targets = text_tokens[:, 1:]
+            
+            # DIAGNOSTIC: Check targets (first batch only, first epoch only)
+            if batch_idx == 0 and epoch == 0 and tokenizer is not None:
+                with torch.no_grad():
+                    # Check target token distribution
+                    targets_flat = targets.reshape(-1).cpu()
+                    unique_tokens, counts = torch.unique(targets_flat, return_counts=True)
+                    top10_indices = counts.argsort(descending=True)[:10]
+                    top10_tokens = unique_tokens[top10_indices]
+                    top10_counts = counts[top10_indices]
+                    
+                    print(f"\n[DEBUG] Target tokens analysis (first batch, epoch {epoch}):")
+                    print(f"  Total target tokens: {len(targets_flat)}")
+                    print(f"  Unique tokens: {len(unique_tokens)}")
+                    print(f"  Top 10 most frequent target tokens:")
+                    for i, (token_id, count) in enumerate(zip(top10_tokens, top10_counts)):
+                        token_str = tokenizer.decode([token_id.item()])
+                        pct = (count.item() / len(targets_flat)) * 100
+                        print(f"    {i+1}. ID={token_id.item():5d}, count={count.item():4d} ({pct:5.1f}%), token='{token_str}'")
+                    
+                    # Check if targets are mostly padding
+                    pad_count = (targets_flat == pad_token_id).sum().item()
+                    pad_pct = (pad_count / len(targets_flat)) * 100
+                    print(f"  Padding tokens: {pad_count}/{len(targets_flat)} ({pad_pct:.1f}%)")
+                    if pad_pct > 50:
+                        print(f"  ⚠️  WARNING: More than 50% of targets are padding! This might cause issues.")
+            
+            # DIAGNOSTIC: Check targets (first batch only, first epoch only)
+            if batch_idx == 0 and hasattr(train_epoch, '_first_batch_checked'):
+                pass  # Skip if already checked
+            elif batch_idx == 0:
+                train_epoch._first_batch_checked = True
+                with torch.no_grad():
+                    # Check target token distribution
+                    targets_flat = targets.reshape(-1).cpu()
+                    unique_tokens, counts = torch.unique(targets_flat, return_counts=True)
+                    top10_tokens, top10_counts = unique_tokens[counts.argsort(descending=True)[:10]], counts[counts.argsort(descending=True)[:10]]
+                    
+                    print(f"\n[DEBUG] Target tokens analysis (first batch):")
+                    print(f"  Total target tokens: {len(targets_flat)}")
+                    print(f"  Unique tokens: {len(unique_tokens)}")
+                    print(f"  Top 10 most frequent target tokens:")
+                    for i, (token_id, count) in enumerate(zip(top10_tokens, top10_counts)):
+                        token_str = tokenizer.decode([token_id.item()]) if hasattr(tokenizer, 'decode') else str(token_id.item())
+                        pct = (count.item() / len(targets_flat)) * 100
+                        print(f"    {i+1}. ID={token_id.item():5d}, count={count.item():4d} ({pct:5.1f}%), token='{token_str}'")
+                    
+                    # Check if targets are mostly padding
+                    pad_count = (targets_flat == pad_token_id).sum().item()
+                    pad_pct = (pad_count / len(targets_flat)) * 100
+                    print(f"  Padding tokens: {pad_count}/{len(targets_flat)} ({pad_pct:.1f}%)")
+                    if pad_pct > 50:
+                        print(f"  ⚠️  WARNING: More than 50% of targets are padding! This might cause issues.")
             
             # Get text embeddings for contrastive loss (using frozen BERT)
             text_embeds = strg_output.get('text_embeds')  # (batch_size, graph_embed_dim) from frozen BERT
@@ -289,6 +353,29 @@ def validate(model, dataloader, criterion, device, tokenizer, config):
                     ref_ids = text_tokens[i].cpu().tolist()[:30]
                     pred_ids = generated[i].cpu().tolist()[:30]
                     debug_predictions.append((ref_ids, pred_ids, texts[i], pred_text))
+    
+    # Print debug predictions
+    if len(debug_predictions) > 0:
+        print(f"\n[VALIDATION DEBUG] First {len(debug_predictions)} predictions:")
+        for idx, (ref_ids, pred_ids, ref_text, pred_text) in enumerate(debug_predictions):
+            print(f"\n  Example {idx+1}:")
+            print(f"    Reference: {ref_text[:100]}...")
+            print(f"    Prediction: {pred_text[:100]}...")
+            print(f"    Ref tokens (first 20): {ref_ids[:20]}")
+            print(f"    Pred tokens (first 20): {pred_ids[:20]}")
+            
+            # Check if prediction is mostly commas
+            comma_count = pred_text.count(',')
+            if comma_count > len(pred_text) * 0.5:
+                print(f"    ⚠️  WARNING: Prediction is mostly commas ({comma_count}/{len(pred_text)} chars)")
+            
+            # Check if prediction is repetitive
+            pred_tokens = pred_text.split()
+            if len(pred_tokens) > 0:
+                most_common = max(set(pred_tokens), key=pred_tokens.count)
+                repetition_ratio = pred_tokens.count(most_common) / len(pred_tokens)
+                if repetition_ratio > 0.5:
+                    print(f"    ⚠️  WARNING: Prediction is repetitive ('{most_common}' appears {repetition_ratio:.1%} of the time)")
     
     avg_loss = total_loss / len(dataloader)
     
@@ -518,7 +605,7 @@ def main():
         print(f'\nEpoch {epoch+1}/{config["training"]["num_epochs"]}')
         
         # Train
-        train_loss, train_loss_history = train_epoch(model, train_loader, optimizer, criterion, device, config)
+        train_loss, train_loss_history = train_epoch(model, train_loader, optimizer, criterion, device, config, tokenizer=tokenizer, pad_token_id=pad_token_id, epoch=epoch)
         print(f'Train Loss: {train_loss:.4f}')
         
         # Validate
