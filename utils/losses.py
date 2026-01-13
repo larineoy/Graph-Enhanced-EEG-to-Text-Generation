@@ -33,7 +33,9 @@ class CompositeLoss(nn.Module):
         self.lambda_smooth = lambda_smooth
         self.lambda_contrastive = lambda_contrastive
         self.ignore_index = ignore_index
-        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index)
+        # Add label smoothing to prevent overfitting to most frequent token (e.g., comma)
+        # Label smoothing of 0.1 means 10% of probability mass is distributed uniformly
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=ignore_index, label_smoothing=0.1)
     
     def cross_entropy_loss(self, logits: torch.Tensor, targets: torch.Tensor):
         """
