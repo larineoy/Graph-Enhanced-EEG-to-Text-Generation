@@ -75,7 +75,7 @@ training:
   
   # Overfitting control
   dropout: 0.1  # Applied in model layers
-  early_stopping: false  # Disable it
+  early_stopping: true  # Enable it
   early_stopping_patience: 5  # Stop if no improvement for N epochs
   early_stopping_min_delta: 0.001
   
