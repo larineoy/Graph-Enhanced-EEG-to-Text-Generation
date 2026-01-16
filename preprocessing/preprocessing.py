@@ -141,6 +141,7 @@ class ZuCoDataset(Dataset):
                 raise ValueError("Could not determine channel count from samples")
             
             # Extract electrode positions from first sample if available (from ZuCo chanlocs)
+            first_sample = self.samples[0]  # Define first_sample here
             if 'channel_info' in first_sample and 'electrode_positions' in first_sample['channel_info']:
                 self.electrode_positions = first_sample['channel_info']['electrode_positions']
                 print(f"  ✓ Extracted {len(self.electrode_positions)} electrode positions from ZuCo chanlocs (X, Y, Z)")
@@ -1201,6 +1202,33 @@ class ZuCoDataset(Dataset):
             # 3. Z-score normalization
             eeg_raw = sample['eeg_raw'].copy()
             
+            # CRITICAL: Ensure correct format (C, T) before any processing
+            # ZuCo has ~105 channels, so proper shape is (105, time_steps)
+            shape = eeg_raw.shape
+            
+            # Transpose detection: handle all cases including edge cases like (T, 1)
+            if len(shape) == 2:
+                dim0, dim1 = shape
+                
+                # Case 1: dim0 is in channel range (50-200), dim1 is large -> already correct (C, T)
+                if 50 <= dim0 <= 200 and dim1 > 1000:
+                    pass  # Already correct format
+                # Case 2: dim1 is in channel range (50-200), dim0 is large -> transpose needed (T, C) -> (C, T)
+                elif 50 <= dim1 <= 200 and dim0 > 1000:
+                    eeg_raw = eeg_raw.T
+                # Case 3: dim0 is huge (>1000) and dim1 is small (<50) -> likely (T, 1) or (T, C) with few channels -> transpose
+                elif dim0 > 1000 and dim1 < 50:
+                    eeg_raw = eeg_raw.T
+                # Case 4: dim1 is huge and dim0 is small -> likely (C, T) with few channels, already correct
+                elif dim1 > 1000 and dim0 < 50:
+                    pass  # Already correct
+                # Case 5: Both large or both small -> check ratio: larger/smaller > 100 suggests time/channels
+                elif max(dim0, dim1) / min(dim0, dim1) > 100:
+                    # The larger dimension is likely time, smaller is likely channels
+                    if dim0 > dim1:
+                        eeg_raw = eeg_raw.T
+                # Default: if neither dimension is obviously channels, don't transpose (will be handled by padding later)
+            
             # Show progress for first batch processing (important for num_workers=0 on Windows)
             # With sequential processing, the first batch won't be ready until all samples are processed
             if not hasattr(self, '_last_progress_idx'):
@@ -1231,44 +1259,15 @@ class ZuCoDataset(Dataset):
                       file=sys.stderr, flush=True)
                 self._last_progress_idx = idx
             
-            # Add more detailed progress for samples that might be problematic
-            debug_this_sample = (idx >= 70 and idx <= 80)  # Debug samples around 76
-            if debug_this_sample:
-                import sys
-                print(f"  [DEBUG] Sample {idx+1}: shape={eeg_raw.shape}, dtype={eeg_raw.dtype}, min={eeg_raw.min():.2f}, max={eeg_raw.max():.2f}", 
-                      file=sys.stderr, flush=True)
-            
             # Preprocess EEG
-            if debug_this_sample:
-                import sys
-                print(f"  [DEBUG] Sample {idx+1}: Starting preprocessing...", file=sys.stderr, flush=True)
-            
             eeg_preprocessed = self._preprocess_eeg(eeg_raw)
-            
-            if debug_this_sample:
-                import sys
-                print(f"  [DEBUG] Sample {idx+1}: Preprocessing done, shape={eeg_preprocessed.shape}", 
-                      file=sys.stderr, flush=True)
             
             # Step 2: Extract frequency bands from preprocessed EEG
             # Paper: "Following artifact removal, each EEG window is decomposed into five canonical oscillatory bands"
-            if debug_this_sample:
-                import sys
-                print(f"  [DEBUG] Sample {idx+1}: Starting frequency extraction...", file=sys.stderr, flush=True)
-            
             eeg_bands = self._extract_frequency_bands(eeg_preprocessed)
-            
-            if debug_this_sample:
-                import sys
-                print(f"  [DEBUG] Sample {idx+1}: Frequency extraction done, bands={list(eeg_bands.keys())}", 
-                      file=sys.stderr, flush=True)
             
             # Convert to tensors
             # Use .copy() to ensure contiguous memory layout and avoid negative stride errors
-            if debug_this_sample:
-                import sys
-                print(f"  [DEBUG] Sample {idx+1}: Converting to tensors...", file=sys.stderr, flush=True)
-            
             # Ensure contiguous arrays before tensor conversion (fixes negative stride error)
             # Use .copy() first to ensure fresh memory, then ascontiguousarray for safety
             eeg_preprocessed_contiguous = np.ascontiguousarray(eeg_preprocessed.copy(), dtype=np.float32)
@@ -1280,10 +1279,6 @@ class ZuCoDataset(Dataset):
                 # Make fresh copy and ensure contiguous (fixes negative stride issues)
                 band_eeg_contiguous = np.ascontiguousarray(band_eeg.copy(), dtype=np.float32)
                 eeg_bands_tensor[band_name] = torch.from_numpy(band_eeg_contiguous)
-            
-            if debug_this_sample:
-                import sys
-                print(f"  [DEBUG] Sample {idx+1}: Tensor conversion done", file=sys.stderr, flush=True)
             
             return {
                 'eeg_raw': eeg_raw_tensor,           # (C, T) - preprocessed
@@ -1327,54 +1322,105 @@ def collate_fn(batch, tokenizer=None, max_seq_length=128, max_eeg_length=20000):
     subjects = [item['subject'] for item in batch]
     tasks = [item['task'] for item in batch]
     
-    # Pad raw EEG to same length
-    # Detect format: (C, T) or (T, C)
-    # ZuCo data typically has ~105 channels, so if second dim is around 105, data is likely (T, C)
-    # Check first sample to determine format, then apply consistently to all
-    first_shape = eeg_raw_list[0].shape
-    needs_transpose = first_shape[0] > first_shape[1] and 50 < first_shape[1] < 200  # Typical channel count: ~105
-    if needs_transpose:
-        # Data is in (T, C) format, transpose all to (C, T)
-        eeg_raw_list = [eeg.T for eeg in eeg_raw_list]
+    # EARLY VALIDATION: Check shapes before processing
+    for idx, eeg in enumerate(eeg_raw_list):
+        shape = eeg.shape
+        if len(shape) != 2:
+            import sys
+            print(f"  [ERROR] Sample {idx} has unexpected dimensions: {shape}", file=sys.stderr, flush=True)
+            raise ValueError(f"Expected 2D EEG data, got shape {shape}")
+        
+        channels, time = shape
+        if not (50 <= channels <= 200):
+            import sys
+            print(f"  [ERROR] Sample {idx} has suspicious channel count: {channels} (shape: {shape})", 
+                  file=sys.stderr, flush=True)
+            print(f"  [ERROR] This suggests the data wasn't transposed correctly in __getitem__", 
+                  file=sys.stderr, flush=True)
+    
+    # CRITICAL FIX: Always normalize to 105 channels (model's expected input)
+    # Don't use batch's most common - always use 105 to match model architecture
+    num_channels = 105  # ZuCo standard and model's expected input
+    
+    # Log channel distribution for debugging, but always use 105
+    from collections import Counter
+    channel_counts = [e.shape[0] for e in eeg_raw_list]
+    channel_counter = Counter(channel_counts)
+    
+    # Warn if batch has unusual channel counts, but still normalize to 105
+    reasonable_channel_counts = {k: v for k, v in channel_counter.items() if 50 <= k <= 200}
+    if not reasonable_channel_counts or max(reasonable_channel_counts.items(), key=lambda x: x[1])[0] != 105:
+        import sys
+        if not reasonable_channel_counts:
+            print(f"  [WARNING] No reasonable channel counts (50-200) in batch. Distribution: {dict(channel_counter.most_common(5))}", file=sys.stderr, flush=True)
+        else:
+            most_common = max(reasonable_channel_counts.items(), key=lambda x: x[1])[0]
+            if most_common != 105:
+                print(f"  [INFO] Batch has mostly {most_common} channels, but normalizing all to 105 (model expects 105)", file=sys.stderr, flush=True)
+    
+    # Filter or pad samples to match the most common channel count
+    eeg_raw_normalized = []
+    for idx, eeg in enumerate(eeg_raw_list):
+        current_channels = eeg.shape[0]
+        if current_channels < num_channels:
+            # Pad with zeros (add extra channels)
+            padding = torch.zeros(num_channels - current_channels, eeg.shape[1], dtype=eeg.dtype, device=eeg.device)
+            eeg = torch.cat([eeg, padding], dim=0)
+        elif current_channels > num_channels:
+            # Truncate to match (take first N channels)
+            eeg = eeg[:num_channels, :]
+        eeg_raw_normalized.append(eeg)
     
     # Limit maximum sequence length to avoid memory issues
-    max_eeg_len = max(e.shape[1] for e in eeg_raw_list)
+    max_eeg_len = max(e.shape[1] for e in eeg_raw_normalized)
     original_max_len = max_eeg_len
     if max_eeg_length is not None and max_eeg_len > max_eeg_length:
         # Truncate sequences that are too long to limit memory usage
-        truncated_count = sum(1 for e in eeg_raw_list if e.shape[1] > max_eeg_length)
+        truncated_count = sum(1 for e in eeg_raw_normalized if e.shape[1] > max_eeg_length)
         if truncated_count > 0:
             import sys
             print(f"  [WARNING] Truncating {truncated_count} sequences from {original_max_len} to {max_eeg_length} time steps to avoid memory issues", 
                   file=sys.stderr, flush=True)
-        eeg_raw_list = [eeg[:, :max_eeg_length] if eeg.shape[1] > max_eeg_length else eeg for eeg in eeg_raw_list]
+        eeg_raw_normalized = [eeg[:, :max_eeg_length] if eeg.shape[1] > max_eeg_length else eeg for eeg in eeg_raw_normalized]
         max_eeg_len = max_eeg_length
     
-    num_channels = eeg_raw_list[0].shape[0]
-    
+    # Pad time dimension to same length
     eeg_raw_padded = []
-    for eeg in eeg_raw_list:
+    for eeg in eeg_raw_normalized:
         if eeg.shape[1] < max_eeg_len:
-            padding = torch.zeros(num_channels, max_eeg_len - eeg.shape[1])
+            padding = torch.zeros(num_channels, max_eeg_len - eeg.shape[1], dtype=eeg.dtype, device=eeg.device)
             eeg = torch.cat([eeg, padding], dim=1)
         eeg_raw_padded.append(eeg)
     
     eeg_raw_batch = torch.stack(eeg_raw_padded)  # (batch_size, C, T)
     
-    # Pad frequency bands
+    # Pad frequency bands (normalize channel counts first, same as raw EEG)
     eeg_bands_batch = {}
     for band_name in eeg_bands_list[0].keys():
         band_list = [item[band_name] for item in eeg_bands_list]
-        # Transpose if needed (same format as raw EEG - use same detection logic)
-        if needs_transpose:
-            band_list = [band.T for band in band_list]
+        
+        # Normalize channel counts to match num_channels (same as raw EEG)
+        band_list_normalized = []
+        for idx, band_eeg in enumerate(band_list):
+            current_channels = band_eeg.shape[0]
+            if current_channels < num_channels:
+                # Pad with zeros (add extra channels)
+                padding = torch.zeros(num_channels - current_channels, band_eeg.shape[1], dtype=band_eeg.dtype, device=band_eeg.device)
+                band_eeg = torch.cat([band_eeg, padding], dim=0)
+            elif current_channels > num_channels:
+                # Truncate to match (take first N channels)
+                band_eeg = band_eeg[:num_channels, :]
+            band_list_normalized.append(band_eeg)
+        
         # Truncate if needed (same max length limit)
         if max_eeg_length is not None:
-            band_list = [band[:, :max_eeg_len] if band.shape[1] > max_eeg_len else band for band in band_list]
+            band_list_normalized = [band[:, :max_eeg_len] if band.shape[1] > max_eeg_len else band for band in band_list_normalized]
+        
+        # Pad time dimension
         band_padded = []
-        for band_eeg in band_list:
+        for band_eeg in band_list_normalized:
             if band_eeg.shape[1] < max_eeg_len:
-                padding = torch.zeros(num_channels, max_eeg_len - band_eeg.shape[1])
+                padding = torch.zeros(num_channels, max_eeg_len - band_eeg.shape[1], dtype=band_eeg.dtype, device=band_eeg.device)
                 band_eeg = torch.cat([band_eeg, padding], dim=1)
             band_padded.append(band_eeg)
         eeg_bands_batch[band_name] = torch.stack(band_padded)  # (batch_size, C, T)
