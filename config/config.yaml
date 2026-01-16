@@ -70,8 +70,9 @@ training:
   gradient_clip: 1.0
   
   # Loss weights
-  lambda_smooth: 0.1  # Graph smoothness regularization
-  lambda_contrastive: 0.0  # Contrastive alignment loss (DISABLED initially - enable after CE learns words)
+  lambda_smooth: 0.05  # Graph smoothness regularization
+  lambda_contrastive: 0.05 #Contrastive alignment loss (DISABLED initially - enable after CE learns words)
+  lambda_diversity: 1.0  # STRE embedding diversity loss (prevents mode collapse)
   
   # Overfitting control
   dropout: 0.1  # Applied in model layers
