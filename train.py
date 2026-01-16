@@ -252,30 +252,53 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config, tokeniz
             optimizer.zero_grad()
             loss.backward()
             
-            # DIAGNOSTIC: Check gradients (first batch only)
-            if batch_idx == 0:
-                total_grad_norm = 0.0
-                param_count = 0
-                zero_grad_count = 0
-                for name, param in model.named_parameters():
-                    if param.grad is not None:
-                        param_grad_norm = param.grad.norm().item()
-                        total_grad_norm += param_grad_norm
-                        param_count += 1
-                        if param_grad_norm < 1e-8:
-                            zero_grad_count += 1
-                    else:
-                        zero_grad_count += 1
-                if param_count > 0:
-                    avg_grad_norm = total_grad_norm / param_count
-                    print(f"  Gradient check: avg_norm={avg_grad_norm:.6f}, zero_grad_params={zero_grad_count}")
-                    if avg_grad_norm < 1e-6:
-                        print(f"  ⚠️  WARNING: Gradients are very small! Model may not be learning.")
-                else:
-                    print(f"  ⚠️  WARNING: No gradients found!")
+            # DIAGNOSTIC: Check gradients per component (first batch only)
+            if batch_idx == 0 and epoch % 5 == 0:  # Every 5 epochs
+                print(f"\n{'='*60}")
+                print(f"[GRADIENT CHECK - Epoch {epoch}]")
+                print(f"{'='*60}")
+                
+                # Check each component
+                components = {
+                    'STRG': model.strg,
+                    'STRE (GAT)': model.stre.gat,
+                    'STRE (Temporal)': model.stre.temporal_encoder,
+                    'Decoder': model.decoder
+                }
+                
+                for name, component in components.items():
+                    total_norm = 0.0
+                    param_count = 0
+                    for param in component.parameters():
+                        if param.grad is not None and param.requires_grad:
+                            total_norm += param.grad.norm().item() ** 2
+                            param_count += 1
+                    total_norm = total_norm ** 0.5
+                    
+                    status = "✓ LEARNING" if total_norm > 1e-5 else "⚠️  DEAD"
+                    print(f"{name:20s}: grad_norm={total_norm:10.6f} ({param_count} params) {status}")
+                
+                print(f"{'='*60}\n")
             
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['gradient_clip'])
+            
+            # STRE LEARNING CHECK - temporary diagnostic (first batch, first epoch only)
+            if batch_idx == 0 and epoch == 0:
+                print(f"\n[STRE LEARNING CHECK - Before optimizer.step()]")
+                
+                # Save current STRE embeddings before optimizer step
+                with torch.no_grad():
+                    eeg_embeds_before = strg_output['stre_embeds'].squeeze(1).clone()
+                
+                # Apply one optimizer step (this will happen below, but we check diversity first)
+                if eeg_embeds_before.shape[0] > 1:
+                    std_per_dim = eeg_embeds_before.std(dim=0).mean().item()
+                    print(f"  STRE embedding std per dim (before step): {std_per_dim:.6f}")
+                    if std_per_dim < 0.01:
+                        print(f"  ⚠️  STRE embeddings are NOT diverse! Collapse detected!")
+                    else:
+                        print(f"  ✓ STRE embeddings are diverse")
             
             optimizer.step()
             
@@ -312,7 +335,10 @@ def validate(model, dataloader, criterion, device, tokenizer, config):
     debug_predictions = []
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc='Validating'):
+        # Track STRE embeddings to check for collapse
+        stre_embeds_list = []
+        
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc='Validating')):
             # Use eeg_bands dict from preprocessing
             eeg_bands = {band_name: band_tensor.to(device) for band_name, band_tensor in batch['eeg_bands'].items()}
             text_tokens = batch['text_tokens'].to(device)
@@ -328,6 +354,40 @@ def validate(model, dataloader, criterion, device, tokenizer, config):
             
             # Forward pass
             logits, strg_output = model(eeg_bands, text_tokens, tgt_key_padding_mask=tgt_key_padding_mask)
+            
+            # CRITICAL DIAGNOSTIC: Check STRE embedding diversity (first batch only)
+            if batch_idx == 0:
+                stre_embeds = strg_output['stre_embeds'].squeeze(1)  # (batch_size, graph_embed_dim)
+                stre_embeds_list.append(stre_embeds.cpu())
+                
+                # Check if embeddings are collapsing (all similar)
+                if stre_embeds.shape[0] > 1:
+                    # Compute pairwise cosine similarities
+                    from torch.nn.functional import cosine_similarity
+                    similarities = []
+                    for i in range(stre_embeds.shape[0]):
+                        for j in range(i+1, stre_embeds.shape[0]):
+                            sim = cosine_similarity(stre_embeds[i:i+1], stre_embeds[j:j+1], dim=1).item()
+                            similarities.append(sim)
+                    
+                    avg_sim = sum(similarities) / len(similarities) if similarities else 1.0
+                    max_sim = max(similarities) if similarities else 1.0
+                    
+                    print(f"\n[VALIDATION DEBUG] STRE Embedding Diversity Check:")
+                    print(f"  Batch size: {stre_embeds.shape[0]}")
+                    print(f"  Embedding dim: {stre_embeds.shape[1]}")
+                    print(f"  Average pairwise cosine similarity: {avg_sim:.4f}")
+                    print(f"  Max pairwise cosine similarity: {max_sim:.4f}")
+                    print(f"  Embedding norms: min={stre_embeds.norm(dim=1).min().item():.4f}, max={stre_embeds.norm(dim=1).max().item():.4f}, mean={stre_embeds.norm(dim=1).mean().item():.4f}")
+                    print(f"  Embedding std per dim: mean={stre_embeds.std(dim=0).mean().item():.4f}, max={stre_embeds.std(dim=0).max().item():.4f}")
+                    
+                    if avg_sim > 0.95:
+                        print(f"  ⚠️  CRITICAL: STRE embeddings are collapsing! (avg similarity > 0.95)")
+                        print(f"  ⚠️  This means all EEG inputs produce similar embeddings, causing identical predictions.")
+                    elif avg_sim > 0.8:
+                        print(f"  ⚠️  WARNING: STRE embeddings are too similar (avg similarity > 0.8)")
+                    else:
+                        print(f"  ✓ STRE embeddings are diverse (avg similarity < 0.8)")
             
             # Ensure logits length matches targets (safety check)
             if logits.shape[1] != targets.shape[1]:
@@ -597,11 +657,12 @@ def main():
     criterion = CompositeLoss(
         lambda_smooth=config['training']['lambda_smooth'],
         lambda_contrastive=config['training']['lambda_contrastive'],
+        lambda_diversity=config['training'].get('lambda_diversity', 0.01),  # Diversity loss to prevent STRE collapse
         vocab_size=config['model']['decoder']['vocab_size'],
         ignore_index=pad_token_id  # CRITICAL: Ignore padding tokens (0) in loss calculation
     )
     # Verify ignore_index is correctly set (CRITICAL DEBUG CHECK)
-    print(f"  ✓ Loss function: Composite (λ_smooth={config['training']['lambda_smooth']}, λ_contrastive={config['training']['lambda_contrastive']})")
+    print(f"  ✓ Loss function: Composite (λ_smooth={config['training']['lambda_smooth']}, λ_contrastive={config['training']['lambda_contrastive']}, λ_diversity={config['training'].get('lambda_diversity', 0.01)})")
     print(f"  ✓ CE ignore_index = {criterion.ce_loss.ignore_index}")
     print(f"  ✓ pad_token_id = {pad_token_id}")
     if criterion.ce_loss.ignore_index != pad_token_id:

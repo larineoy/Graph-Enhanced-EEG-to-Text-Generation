@@ -20,6 +20,7 @@ class CompositeLoss(nn.Module):
         self,
         lambda_smooth: float = 0.1,
         lambda_contrastive: float = 0.2,
+        lambda_diversity: float = 1.0,  # NEW: Diversity regularization to prevent STRE collapse
         vocab_size: int = 10000,
         ignore_index: int = -100
     ):
@@ -27,12 +28,14 @@ class CompositeLoss(nn.Module):
         Args:
             lambda_smooth: Weight for graph smoothness loss
             lambda_contrastive: Weight for contrastive alignment loss
+            lambda_diversity: Weight for STRE embedding diversity loss (prevents collapse)
             vocab_size: Vocabulary size for cross-entropy
             ignore_index: Index to ignore in cross-entropy loss
         """
         super(CompositeLoss, self).__init__()
         self.lambda_smooth = lambda_smooth
         self.lambda_contrastive = lambda_contrastive
+        self.lambda_diversity = lambda_diversity
         self.ignore_index = ignore_index
         
         # ========================================================================
@@ -177,9 +180,55 @@ class CompositeLoss(nn.Module):
             loss_dict['contrastive_loss'] = contrastive_loss.item()
             total_loss = total_loss + self.lambda_contrastive * contrastive_loss
         
+        # Diversity loss: Prevent STRE embedding collapse
+        # Encourages embeddings to be diverse by penalizing high similarity
+        if eeg_embeddings is not None and eeg_embeddings.shape[0] > 1:
+            diversity_loss = self.diversity_loss(eeg_embeddings)
+            loss_dict['diversity_loss'] = diversity_loss.item()
+            total_loss = total_loss + self.lambda_diversity * diversity_loss
+    
+            # NEW: Variance regularization
+            batch_variance = torch.var(eeg_embeddings, dim=0).mean()
+            variance_penalty = 1.0 / (batch_variance + 1e-6)
+            loss_dict['variance_penalty'] = variance_penalty.item()
+            loss_dict['batch_variance'] = batch_variance.item()
+            total_loss = total_loss + 0.1 * variance_penalty
+        
         loss_dict['total_loss'] = total_loss.item()
         
         return total_loss, loss_dict
+    
+    def diversity_loss(self, embeddings: torch.Tensor):
+        """
+        Diversity loss to prevent embedding collapse.
+        Penalizes high pairwise similarity between embeddings.
+        
+        Args:
+            embeddings: STRE embeddings (batch_size, embed_dim)
+            
+        Returns:
+            loss: Diversity loss (lower = more diverse)
+        """
+        batch_size = embeddings.shape[0]
+        if batch_size < 2:
+            return torch.tensor(0.0, device=embeddings.device)
+        
+        # Normalize embeddings
+        embeddings_norm = F.normalize(embeddings, p=2, dim=1)  # (batch_size, embed_dim)
+        
+        # Compute pairwise cosine similarities
+        # similarity[i,j] = cosine(emb[i], emb[j])
+        similarity_matrix = torch.mm(embeddings_norm, embeddings_norm.t())  # (batch_size, batch_size)
+        
+        # Remove diagonal (self-similarity = 1.0)
+        mask = ~torch.eye(batch_size, dtype=torch.bool, device=embeddings.device)
+        off_diagonal_similarities = similarity_matrix[mask]
+        
+        # Penalize high similarities (encourage diversity)
+        # Loss = mean of squared similarities (encourages them to be close to 0)
+        diversity_loss = torch.mean(off_diagonal_similarities ** 2)
+        
+        return diversity_loss
 
 
 # ============================================================================

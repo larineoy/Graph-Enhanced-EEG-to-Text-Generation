@@ -142,7 +142,20 @@ class AttentionReadout(nn.Module):
         self.W = nn.Linear(node_dim, output_dim)
         self.query = nn.Parameter(torch.randn(output_dim))
         self.activation = nn.Tanh()
-    
+        # Better initialization for gradients
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights for better gradient flow"""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+        
     def forward(self, h: torch.Tensor):
         """
         Args:

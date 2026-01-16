@@ -172,7 +172,7 @@ class STRG(nn.Module):
         # Use absolute correlation for non-negative adjacency weights
         # Note: This differs from signed Pearson correlation but is standard for graph construction
         # where edge weights should be non-negative. The absolute value preserves magnitude of correlation.
-        A_functional = torch.abs(A_functional)
+        A_functional = (A_functional + 1.0) / 2.0  # Maps [-1, 1] → [0, 1]
         
         # Ensure diagonal is 1 (self-connection)
         A_functional = A_functional - torch.diag(torch.diag(A_functional)) + torch.eye(num_channels, device=device)
