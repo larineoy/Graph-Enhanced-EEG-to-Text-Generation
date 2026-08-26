@@ -66,10 +66,12 @@ def create_model(config, device):
         sampling_rate=250.0,
         
         # STRG
-        strg_alpha=strg_config['alpha'],
-        strg_beta=strg_config['beta'],
+        k_spatial=strg_config.get('k_spatial', 6),
+        k_functional=strg_config.get('k_functional', 6),
         use_spatial_topology=strg_config['use_spatial_topology'],
         use_functional_connectivity=strg_config['use_functional_connectivity'],
+        use_frequency_nodes=strg_config.get('use_frequency_nodes', True),
+        dynamic_functional=strg_config.get('dynamic_functional', True),
         
         # STRE
         node_dim=stre_config['node_dim'],
@@ -83,13 +85,8 @@ def create_model(config, device):
         temporal_dropout=stre_config['temporal_dropout'],
         
         # Decoder
-        vocab_size=decoder_config['vocab_size'],
-        decoder_embed_dim=decoder_config['embed_dim'],
-        num_decoder_layers=decoder_config['num_layers'],
-        num_decoder_heads=decoder_config['num_heads'],
-        decoder_ff_dim=decoder_config['ff_dim'],
-        decoder_dropout=decoder_config['dropout'],
-        max_decoder_length=decoder_config['max_decoder_length'],
+        decoder_pretrained_name=decoder_config.get('pretrained_name', 'facebook/bart-base'),
+        max_decoder_length=decoder_config.get('max_decoder_length', 128),
         
         device=device
     )
@@ -107,30 +104,26 @@ def train_epoch(model, dataloader, optimizer, scheduler, criterion, device, conf
     for batch_idx, batch in enumerate(pbar):
         # Use eeg_bands dict from preprocessing
         eeg_bands = {band_name: band_tensor.to(device) for band_name, band_tensor in batch['eeg_bands'].items()}
+        window_mask = batch['window_mask'].to(device) if 'window_mask' in batch else None
+        eeg_bands_full = None
+        if batch.get('eeg_bands_full') is not None:
+            eeg_bands_full = {k: v.to(device) for k, v in batch['eeg_bands_full'].items()}
+        eeg_windows = batch['eeg_windows'].to(device) if batch.get('eeg_windows') is not None else None
         text_tokens = batch['text_tokens'].to(device)
-        
-        # Forward pass
-        logits, strg_output = model(eeg_bands, text_tokens)
-        
-        # Compute loss
-        # Shift for teacher forcing
-        targets = text_tokens[:, 1:]
-        
-        # Get embeddings for contrastive loss
-        # EEG embeddings: average over temporal dimension (currently single window, so just squeeze)
-        eeg_embeds = strg_output['stre_embeds'].squeeze(1)  # (batch_size, graph_embed_dim)
-        
-        # Text embeddings: obtained from model's text encoder
-        text_embeds = strg_output.get('text_embeds', None)  # (batch_size, graph_embed_dim)
-        
-        loss, loss_dict = criterion(
-            logits=logits,
-            targets=targets,
-            node_embeddings=strg_output['node_features'],
-            adjacency_matrix=strg_output['A'],
-            eeg_embeddings=eeg_embeds,
-            text_embeddings=text_embeds
+
+        logits, strg_output = model(
+            eeg_bands,
+            text_tokens,
+            window_mask=window_mask,
+            eeg_bands_full=eeg_bands_full,
+            eeg_windows=eeg_windows
         )
+        targets = text_tokens
+        if logits.shape[1] != targets.shape[1]:
+            min_len = min(logits.shape[1], targets.shape[1])
+            logits = logits[:, :min_len, :]
+            targets = targets[:, :min_len]
+        loss, loss_dict = criterion(logits=logits, targets=targets)
         
         # Backward pass
         optimizer.zero_grad()
@@ -174,7 +167,7 @@ def validate(model, dataloader, criterion, device, tokenizer, config):
             logits, strg_output = model(eeg_bands, text_tokens)
             
             # Compute loss
-            targets = text_tokens[:, 1:]
+            targets = text_tokens
             loss, _ = criterion(logits=logits, targets=targets)
             total_loss += loss.item()
             
@@ -241,10 +234,9 @@ def main():
     print("\n[STAGE 3/7] Initializing tokenizer...")
     # Create tokenizer
     try:
-        tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        print("  ✓ BERT tokenizer loaded successfully")
+        decoder_name = config['model']['decoder'].get('pretrained_name', 'facebook/bart-base')
+        tokenizer = AutoTokenizer.from_pretrained(decoder_name, use_fast=True)
+        print(f"  ✓ {decoder_name} tokenizer loaded successfully")
     except:
         print("  ⚠ Warning: Could not load tokenizer, using simple tokenizer")
         tokenizer = None
@@ -254,28 +246,21 @@ def main():
     
     # Create datasets with artifact removal settings from config
     data_config = config['data']
-    train_dataset = ZuCoDataset(
-        args.data_dir,
-        split='train',
+    ds_kwargs = dict(
         max_seq_length=data_config['max_seq_length'],
         apply_notch_filter=data_config.get('apply_notch_filter', True),
         notch_freq=data_config.get('notch_freq', 50.0),
         apply_highpass_filter=data_config.get('apply_highpass_filter', True),
         highpass_cutoff=data_config.get('highpass_cutoff', 0.5),
         detect_bad_channels=data_config.get('detect_bad_channels', False),
-        bad_channel_threshold=data_config.get('bad_channel_threshold', 3.0)
+        bad_channel_threshold=data_config.get('bad_channel_threshold', 3.0),
+        split_seed=data_config.get('split_seed', 42),
+        window_size_sec=data_config.get('window_size_sec', 1.0),
+        window_stride_sec=data_config.get('window_stride_sec', 1.0),
+        max_windows=data_config.get('max_windows', 16),
     )
-    val_dataset = ZuCoDataset(
-        args.data_dir,
-        split='val',
-        max_seq_length=data_config['max_seq_length'],
-        apply_notch_filter=data_config.get('apply_notch_filter', True),
-        notch_freq=data_config.get('notch_freq', 50.0),
-        apply_highpass_filter=data_config.get('apply_highpass_filter', True),
-        highpass_cutoff=data_config.get('highpass_cutoff', 0.5),
-        detect_bad_channels=data_config.get('detect_bad_channels', False),
-        bad_channel_threshold=data_config.get('bad_channel_threshold', 3.0)
-    )
+    train_dataset = ZuCoDataset(args.data_dir, split='train', **ds_kwargs)
+    val_dataset = ZuCoDataset(args.data_dir, split='val', **ds_kwargs)
     
     print(f"  ✓ Train dataset: {len(train_dataset)} samples")
     print(f"  ✓ Validation dataset: {len(val_dataset)} samples")
@@ -309,11 +294,14 @@ def main():
     else:
         num_workers = config.get('num_workers', 0)  # Default to 0 if not specified
     
+    max_eeg_length = config['model'].get('max_eeg_length', 20000)
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=True,
-        collate_fn=lambda x: collate_fn(x, tokenizer, config['data']['max_seq_length']),
+        collate_fn=lambda x: collate_fn(
+            x, tokenizer, config['data']['max_seq_length'], max_eeg_length=max_eeg_length
+        ),
         num_workers=num_workers
     )
     
@@ -321,7 +309,9 @@ def main():
         val_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        collate_fn=lambda x: collate_fn(x, tokenizer, config['data']['max_seq_length']),
+        collate_fn=lambda x: collate_fn(
+            x, tokenizer, config['data']['max_seq_length'], max_eeg_length=max_eeg_length
+        ),
         num_workers=num_workers
     )
     print(f"  ✓ Train batches: {len(train_loader)}")
@@ -370,10 +360,12 @@ def main():
     print(f"    Total training steps: {total_training_steps}")
     
     # Create loss function
+    pad_token_id = tokenizer.pad_token_id if tokenizer is not None and tokenizer.pad_token_id is not None else 1
     criterion = CompositeLoss(
         lambda_smooth=config['training']['lambda_smooth'],
         lambda_contrastive=config['training']['lambda_contrastive'],
-        vocab_size=config['model']['decoder']['vocab_size']
+        vocab_size=getattr(tokenizer, 'vocab_size', config['model']['decoder'].get('vocab_size', 50265)),
+        ignore_index=pad_token_id
     )
     print(f"  ✓ Loss function: Composite (λ_smooth={config['training']['lambda_smooth']}, λ_contrastive={config['training']['lambda_contrastive']})")
     

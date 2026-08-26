@@ -22,7 +22,14 @@ from utils.losses import CompositeLoss
 from utils.metrics import evaluate_predictions
 from utils.sensitivity import generate_hyperparameter_grid, generate_loss_weight_grid
 from utils.statistics import compute_statistics
-from train import load_config, set_seed
+from train import (
+    load_config,
+    set_seed,
+    dataset_kwargs_from_config,
+    get_decoder_tokenizer,
+    move_eeg_batch,
+    sync_model_config_from_dataset,
+)
 
 
 def evaluate_hyperparameter_config(
@@ -31,18 +38,19 @@ def evaluate_hyperparameter_config(
     val_loader: DataLoader,
     device: torch.device,
     tokenizer,
-    num_epochs: int = 20
+    num_epochs: int = 20,
+    electrode_positions=None
 ):
     """Quick evaluation of a hyperparameter configuration"""
-    
-    # Create model with this config
     model = GraphEnhancedEEG2Text(
         num_channels=config['num_channels'],
         num_frequency_bands=config['num_frequency_bands'],
-        strg_alpha=config.get('strg_alpha', 0.5),
-        strg_beta=config.get('strg_beta', 0.5),
+        k_spatial=config.get('k_spatial', 6),
+        k_functional=config.get('k_functional', 6),
         use_spatial_topology=config.get('use_spatial_topology', True),
         use_functional_connectivity=config.get('use_functional_connectivity', True),
+        use_frequency_nodes=config.get('use_frequency_nodes', True),
+        dynamic_functional=config.get('dynamic_functional', True),
         node_dim=config.get('node_dim', 1),
         graph_embed_dim=config['graph_embed_dim'],
         num_gat_layers=config.get('num_gat_layers', 2),
@@ -52,82 +60,73 @@ def evaluate_hyperparameter_config(
         num_temporal_heads=config.get('num_temporal_heads', 8),
         temporal_ff_dim=config.get('temporal_ff_dim', 512),
         temporal_dropout=config.get('temporal_dropout', 0.1),
-        vocab_size=config['vocab_size'],
-        decoder_embed_dim=config['decoder_embed_dim'],
-        num_decoder_layers=config.get('num_decoder_layers', 4),
-        num_decoder_heads=config.get('num_decoder_heads', 8),
-        decoder_ff_dim=config.get('decoder_ff_dim', 512),
-        decoder_dropout=config.get('decoder_dropout', 0.1),
+        decoder_pretrained_name=config.get('decoder_pretrained_name', 'facebook/bart-base'),
         max_decoder_length=config.get('max_decoder_length', 128),
         device=device
     )
+    if electrode_positions is not None:
+        model.set_electrode_positions(electrode_positions)
     model = model.to(device)
-    
+
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 1
     optimizer = optim.AdamW(
         model.parameters(),
         lr=config.get('learning_rate', 1e-4),
         weight_decay=config.get('weight_decay', 1e-5)
     )
-    
     criterion = CompositeLoss(
-        lambda_smooth=config.get('lambda_smooth', 0.1),
-        lambda_contrastive=config.get('lambda_contrastive', 0.2),
-        vocab_size=config['vocab_size']
+        lambda_smooth=config.get('lambda_smooth', 0.0),
+        lambda_contrastive=config.get('lambda_contrastive', 0.0),
+        vocab_size=getattr(tokenizer, 'vocab_size', len(tokenizer)),
+        ignore_index=pad_token_id
     )
-    
-    # Quick training
+
     best_val_metrics = None
     for epoch in range(num_epochs):
         model.train()
         for batch in train_loader:
-            eeg_bands = {k: v.to(device) for k, v in batch['eeg_bands'].items()}
+            eeg_bands, window_mask, eeg_bands_full, eeg_windows = move_eeg_batch(batch, device)
             text_tokens = batch['text_tokens'].to(device)
-            
-            logits, strg_output = model(eeg_bands, text_tokens)
-            targets = text_tokens[:, 1:]
-            
-            loss, _ = criterion(
-                logits=logits,
-                targets=targets,
-                node_embeddings=strg_output.get('node_features'),
-                adjacency_matrix=strg_output.get('A')
+            logits, _ = model(
+                eeg_bands,
+                text_tokens,
+                window_mask=window_mask,
+                eeg_bands_full=eeg_bands_full,
+                eeg_windows=eeg_windows
             )
-            
+            targets = text_tokens
+            if logits.shape[1] != targets.shape[1]:
+                min_len = min(logits.shape[1], targets.shape[1])
+                logits = logits[:, :min_len, :]
+                targets = targets[:, :min_len]
+            loss, _ = criterion(logits=logits, targets=targets)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        
-        # Quick validation
+
         if epoch % 5 == 0:
             model.eval()
             all_references = []
             all_candidates = []
-            
             with torch.no_grad():
                 for batch in val_loader:
-                    eeg_bands = {k: v.to(device) for k, v in batch['eeg_bands'].items()}
-                    texts = batch['text']
-                    
+                    eeg_bands, window_mask, eeg_bands_full, eeg_windows = move_eeg_batch(batch, device)
                     generated = model.generate(
                         eeg_bands,
-                        bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else 1,
-                        eos_token_id=tokenizer.eos_token_id if hasattr(tokenizer, 'eos_token_id') else 2,
-                        max_length=config.get('max_decoder_length', 128)
+                        max_length=config.get('max_decoder_length', 128),
+                        window_mask=window_mask,
+                        eeg_bands_full=eeg_bands_full,
+                        eeg_windows=eeg_windows
                     )
-                    
-                    for i, text in enumerate(texts):
-                        ref = text.split()
-                        if hasattr(tokenizer, 'decode'):
-                            cand = tokenizer.decode(generated[i].cpu().tolist()).split()
-                        else:
-                            cand = [str(t.item()) for t in generated[i]]
-                        all_references.append(ref)
-                        all_candidates.append(cand)
-            
+                    for i, text in enumerate(batch['text']):
+                        all_references.append(text.split())
+                        all_candidates.append(
+                            tokenizer.decode(generated[i].cpu().tolist(), skip_special_tokens=True).split()
+                        )
             metrics = evaluate_predictions(all_references, all_candidates, compute_bert=False)
             if best_val_metrics is None or metrics.get('bleu_4', 0) > best_val_metrics.get('bleu_4', 0):
                 best_val_metrics = metrics
-    
+
     return best_val_metrics or {}
 
 
@@ -136,8 +135,8 @@ def main():
     parser.add_argument('--config', type=str, default='config/config.yaml')
     parser.add_argument('--data_dir', type=str, default='data')
     parser.add_argument('--output_dir', type=str, default='sensitivity_results')
-    parser.add_argument('--analysis_type', type=str, default='alpha_beta',
-                       choices=['alpha_beta', 'loss_weights', 'architecture'],
+    parser.add_argument('--analysis_type', type=str, default='k_neighbors',
+                       choices=['k_neighbors', 'alpha_beta', 'loss_weights', 'architecture'],
                        help='Type of sensitivity analysis')
     parser.add_argument('--num_epochs', type=int, default=20,
                        help='Number of epochs per configuration (reduced for speed)')
@@ -150,49 +149,40 @@ def main():
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Create datasets
-    train_dataset = ZuCoDataset(
-        args.data_dir,
-        split='train',
-        max_seq_length=config['data']['max_seq_length']
-    )
-    val_dataset = ZuCoDataset(
-        args.data_dir,
-        split='val',
-        max_seq_length=config['data']['max_seq_length']
-    )
-    
-    try:
-        tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-    except:
-        tokenizer = None
-    
+    tokenizer = get_decoder_tokenizer(config)
+    train_dataset = ZuCoDataset(args.data_dir, split='train', **dataset_kwargs_from_config(config))
+    val_dataset = ZuCoDataset(args.data_dir, split='val', **dataset_kwargs_from_config(config))
+    sync_model_config_from_dataset(config, train_dataset)
+
+    max_eeg_length = config['model'].get('max_eeg_length', 20000)
     train_loader = DataLoader(
         train_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=True,
-        collate_fn=lambda x: collate_fn(x, tokenizer, config['data']['max_seq_length']),
-        num_workers=config['num_workers']
+        collate_fn=lambda x: collate_fn(
+            x, tokenizer, config['data']['max_seq_length'], max_eeg_length=max_eeg_length
+        ),
+        num_workers=config.get('num_workers', 0)
     )
-    
     val_loader = DataLoader(
         val_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        collate_fn=lambda x: collate_fn(x, tokenizer, config['data']['max_seq_length']),
-        num_workers=config['num_workers']
+        collate_fn=lambda x: collate_fn(
+            x, tokenizer, config['data']['max_seq_length'], max_eeg_length=max_eeg_length
+        ),
+        num_workers=config.get('num_workers', 0)
     )
-    
-    # Generate hyperparameter grid
+
     base_config = {
         'num_channels': config['model']['num_channels'],
         'num_frequency_bands': config['model']['num_frequency_bands'],
-        'strg_alpha': config['model']['strg']['alpha'],
-        'strg_beta': config['model']['strg']['beta'],
+        'k_spatial': config['model']['strg'].get('k_spatial', 6),
+        'k_functional': config['model']['strg'].get('k_functional', 6),
         'use_spatial_topology': config['model']['strg']['use_spatial_topology'],
         'use_functional_connectivity': config['model']['strg']['use_functional_connectivity'],
+        'use_frequency_nodes': config['model']['strg'].get('use_frequency_nodes', True),
+        'dynamic_functional': config['model']['strg'].get('dynamic_functional', True),
         'node_dim': config['model']['stre']['node_dim'],
         'graph_embed_dim': config['model']['stre']['graph_embed_dim'],
         'num_gat_layers': config['model']['stre']['num_gat_layers'],
@@ -202,20 +192,15 @@ def main():
         'num_temporal_heads': config['model']['stre']['num_temporal_heads'],
         'temporal_ff_dim': config['model']['stre']['temporal_ff_dim'],
         'temporal_dropout': config['model']['stre']['temporal_dropout'],
-        'vocab_size': config['model']['decoder']['vocab_size'],
-        'decoder_embed_dim': config['model']['decoder']['embed_dim'],
-        'num_decoder_layers': config['model']['decoder']['num_layers'],
-        'num_decoder_heads': config['model']['decoder']['num_heads'],
-        'decoder_ff_dim': config['model']['decoder']['ff_dim'],
-        'decoder_dropout': config['model']['decoder']['dropout'],
+        'decoder_pretrained_name': config['model']['decoder'].get('pretrained_name', 'facebook/bart-base'),
         'max_decoder_length': config['model']['decoder']['max_decoder_length'],
         'learning_rate': config['training']['learning_rate'],
         'weight_decay': config['training']['weight_decay'],
         'lambda_smooth': config['training']['lambda_smooth'],
         'lambda_contrastive': config['training']['lambda_contrastive']
     }
-    
-    if args.analysis_type == 'alpha_beta':
+
+    if args.analysis_type in ('k_neighbors', 'alpha_beta'):
         from utils.sensitivity import generate_hyperparameter_grid
         config_grid = generate_hyperparameter_grid(base_config)
     elif args.analysis_type == 'loss_weights':
@@ -238,7 +223,8 @@ def main():
             val_loader,
             device,
             tokenizer,
-            num_epochs=args.num_epochs
+            num_epochs=args.num_epochs,
+            electrode_positions=getattr(train_dataset, 'electrode_positions', None)
         )
         
         result = {

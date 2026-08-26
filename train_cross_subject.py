@@ -22,7 +22,15 @@ from utils.losses import CompositeLoss
 from utils.metrics import evaluate_predictions
 from utils.cross_subject import CrossSubjectEvaluator
 from utils.statistics import compute_statistics
-from train import load_config, create_model, set_seed
+from train import (
+    load_config,
+    create_model,
+    set_seed,
+    dataset_kwargs_from_config,
+    get_decoder_tokenizer,
+    move_eeg_batch,
+    sync_model_config_from_dataset,
+)
 
 
 def train_and_evaluate_loso(
@@ -46,13 +54,13 @@ def train_and_evaluate_loso(
     full_dataset = ZuCoDataset(
         data_dir,
         split='all',
-        max_seq_length=config['data']['max_seq_length'],
-        apply_notch_filter=config['data'].get('apply_notch_filter', True),
-        notch_freq=config['data'].get('notch_freq', 50.0),
-        apply_highpass_filter=config['data'].get('apply_highpass_filter', True),
-        highpass_cutoff=config['data'].get('highpass_cutoff', 0.5)
+        **dataset_kwargs_from_config(config)
     )
-    
+    sync_model_config_from_dataset(config, full_dataset)
+    tokenizer = get_decoder_tokenizer(config)
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 1
+    max_eeg_length = config['model'].get('max_eeg_length', 20000)
+
     evaluator = CrossSubjectEvaluator(full_dataset)
     loso_splits = evaluator.leave_one_subject_out_splits()
     
@@ -75,93 +83,83 @@ def train_and_evaluate_loso(
             train_dataset = Subset(full_dataset, train_indices)
             test_dataset = Subset(full_dataset, test_indices)
             
-            try:
-                tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-                if tokenizer.pad_token is None:
-                    tokenizer.pad_token = tokenizer.eos_token
-            except:
-                tokenizer = None
-            
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=config['training']['batch_size'],
                 shuffle=True,
-                collate_fn=lambda x: collate_fn(x, tokenizer, config['data']['max_seq_length']),
-                num_workers=config['num_workers']
+                collate_fn=lambda x: collate_fn(
+                    x, tokenizer, config['data']['max_seq_length'], max_eeg_length=max_eeg_length
+                ),
+                num_workers=config.get('num_workers', 0)
             )
-            
             test_loader = DataLoader(
                 test_dataset,
                 batch_size=config['training']['batch_size'],
                 shuffle=False,
-                collate_fn=lambda x: collate_fn(x, tokenizer, config['data']['max_seq_length']),
-                num_workers=config['num_workers']
+                collate_fn=lambda x: collate_fn(
+                    x, tokenizer, config['data']['max_seq_length'], max_eeg_length=max_eeg_length
+                ),
+                num_workers=config.get('num_workers', 0)
             )
-            
-            # Create and train model
+
             model = create_model(config, device)
+            if getattr(full_dataset, 'electrode_positions', None) is not None:
+                model.set_electrode_positions(full_dataset.electrode_positions)
             model = model.to(device)
-            
+
             optimizer = optim.AdamW(
                 model.parameters(),
                 lr=config['training']['learning_rate'],
                 weight_decay=config['training']['weight_decay']
             )
-            
             criterion = CompositeLoss(
                 lambda_smooth=config['training']['lambda_smooth'],
                 lambda_contrastive=config['training']['lambda_contrastive'],
-                vocab_size=config['model']['decoder']['vocab_size']
+                vocab_size=getattr(tokenizer, 'vocab_size', len(tokenizer)),
+                ignore_index=pad_token_id
             )
-            
-            # Train
-            best_val_loss = float('inf')
+
             for epoch in range(config['training']['num_epochs']):
                 model.train()
                 for batch in tqdm(train_loader, desc=f'Epoch {epoch+1}'):
-                    eeg_bands = {k: v.to(device) for k, v in batch['eeg_bands'].items()}
+                    eeg_bands, window_mask, eeg_bands_full, eeg_windows = move_eeg_batch(batch, device)
                     text_tokens = batch['text_tokens'].to(device)
-                    
-                    logits, strg_output = model(eeg_bands, text_tokens)
-                    targets = text_tokens[:, 1:]
-                    
-                    loss, _ = criterion(
-                        logits=logits,
-                        targets=targets,
-                        node_embeddings=strg_output.get('node_features'),
-                        adjacency_matrix=strg_output.get('A')
+                    logits, _ = model(
+                        eeg_bands,
+                        text_tokens,
+                        window_mask=window_mask,
+                        eeg_bands_full=eeg_bands_full,
+                        eeg_windows=eeg_windows
                     )
-                    
+                    targets = text_tokens
+                    if logits.shape[1] != targets.shape[1]:
+                        min_len = min(logits.shape[1], targets.shape[1])
+                        logits = logits[:, :min_len, :]
+                        targets = targets[:, :min_len]
+                    loss, _ = criterion(logits=logits, targets=targets)
                     optimizer.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['gradient_clip'])
                     optimizer.step()
-            
-            # Evaluate on test subject
+
             model.eval()
             all_references = []
             all_candidates = []
-            
             with torch.no_grad():
                 for batch in tqdm(test_loader, desc='Evaluating'):
-                    eeg_bands = {k: v.to(device) for k, v in batch['eeg_bands'].items()}
-                    texts = batch['text']
-                    
+                    eeg_bands, window_mask, eeg_bands_full, eeg_windows = move_eeg_batch(batch, device)
                     generated = model.generate(
                         eeg_bands,
-                        bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else 1,
-                        eos_token_id=tokenizer.eos_token_id if hasattr(tokenizer, 'eos_token_id') else 2,
-                        max_length=config['model']['decoder']['max_decoder_length']
+                        max_length=config['model']['decoder']['max_decoder_length'],
+                        window_mask=window_mask,
+                        eeg_bands_full=eeg_bands_full,
+                        eeg_windows=eeg_windows
                     )
-                    
-                    for i, text in enumerate(texts):
-                        ref = text.split()
-                        if hasattr(tokenizer, 'decode'):
-                            cand = tokenizer.decode(generated[i].cpu().tolist()).split()
-                        else:
-                            cand = [str(t.item()) for t in generated[i]]
-                        all_references.append(ref)
-                        all_candidates.append(cand)
+                    for i, text in enumerate(batch['text']):
+                        all_references.append(text.split())
+                        all_candidates.append(
+                            tokenizer.decode(generated[i].cpu().tolist(), skip_special_tokens=True).split()
+                        )
             
             metrics = evaluate_predictions(all_references, all_candidates, compute_bert=True)
             subject_results.append(metrics)
@@ -218,8 +216,9 @@ def main():
         full_dataset = ZuCoDataset(
             args.data_dir,
             split='all',
-            max_seq_length=config['data']['max_seq_length']
+            **dataset_kwargs_from_config(config)
         )
+        sync_model_config_from_dataset(config, full_dataset)
         evaluator = CrossSubjectEvaluator(full_dataset)
         train_indices, test_indices = evaluator.train_test_subject_split(
             args.train_subjects or [],

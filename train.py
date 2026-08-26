@@ -53,26 +53,155 @@ def load_config(config_path: str):
     return config
 
 
+def dataset_kwargs_from_config(config):
+    """Shared ZuCoDataset arguments that encode the paper's split and windowing."""
+    data_config = config['data']
+    return dict(
+        max_seq_length=data_config['max_seq_length'],
+        apply_notch_filter=data_config.get('apply_notch_filter', True),
+        notch_freq=data_config.get('notch_freq', 50.0),
+        apply_highpass_filter=data_config.get('apply_highpass_filter', True),
+        highpass_cutoff=data_config.get('highpass_cutoff', 0.5),
+        detect_bad_channels=data_config.get('detect_bad_channels', False),
+        bad_channel_threshold=data_config.get('bad_channel_threshold', 3.0),
+        split_seed=data_config.get('split_seed', 42),
+        window_size_sec=data_config.get('window_size_sec', 1.0),
+        window_stride_sec=data_config.get('window_stride_sec', 1.0),
+        max_windows=data_config.get('max_windows', 16),
+    )
+
+
+def move_eeg_batch(batch, device):
+    eeg_bands = {k: v.to(device) for k, v in batch['eeg_bands'].items()}
+    window_mask = batch['window_mask'].to(device) if 'window_mask' in batch else None
+    eeg_bands_full = None
+    if batch.get('eeg_bands_full') is not None:
+        eeg_bands_full = {k: v.to(device) for k, v in batch['eeg_bands_full'].items()}
+    eeg_windows = batch['eeg_windows'].to(device) if batch.get('eeg_windows') is not None else None
+    return eeg_bands, window_mask, eeg_bands_full, eeg_windows
+
+
+def get_decoder_tokenizer(config):
+    name = config.get('model', {}).get('decoder', {}).get('pretrained_name', 'facebook/bart-base')
+    return AutoTokenizer.from_pretrained(name, use_fast=True)
+
+
+def sync_model_config_from_dataset(config, dataset):
+    if getattr(dataset, 'num_channels', None) is not None:
+        config['model']['num_channels'] = dataset.num_channels
+    return config
+
+
+def resolve_num_workers(config) -> int:
+    """ZuCo is fully in RAM; forking workers duplicates it and OOMs laptops."""
+    import sys
+    requested = int(config.get('num_workers', 0) or 0)
+    if sys.platform in ('darwin', 'win32') and requested > 0:
+        print(f"  ⚠ {sys.platform}: forcing num_workers=0 (DataLoader fork copies the dataset)")
+        return 0
+    return requested
+
+
+def resolve_batch_size(config, device) -> int:
+    batch_size = int(config['training']['batch_size'])
+    if getattr(device, 'type', str(device)) == 'cpu' and batch_size > 2:
+        print(f"  ⚠ CPU: reducing batch_size {batch_size} → 2 (525-node graphs + BART)")
+        config['training']['batch_size'] = 2
+        return 2
+    return batch_size
+
+
+def configure_pretrained_decoder(model, config):
+    """Freeze BART's unused text encoder. Train the decoder so it can read EEG memory M."""
+    bart = getattr(getattr(model, 'decoder', None), 'bart', None)
+    if bart is None:
+        return model
+    decoder_cfg = config.get('model', {}).get('decoder', {})
+    if not decoder_cfg.get('freeze_pretrained', True):
+        return model
+
+    freeze_encoder_only = decoder_cfg.get('freeze_encoder_only', True)
+    for param in bart.parameters():
+        param.requires_grad = False
+
+    if freeze_encoder_only:
+        unfrozen = 0
+        for name, param in bart.named_parameters():
+            if 'model.encoder' not in name:
+                param.requires_grad = True
+                unfrozen += 1
+        print(
+            f"  ✓ Frozen BART text encoder; training {unfrozen} decoder/lm_head tensors + EEG encoder"
+        )
+        return model
+
+    unfrozen = 0
+    unfreeze_decoder = decoder_cfg.get('unfreeze_decoder_layers', True)
+    unfreeze_xattn = decoder_cfg.get('unfreeze_cross_attention', True)
+    for name, param in bart.named_parameters():
+        train_layer = unfreeze_decoder and 'decoder.layers' in name
+        train_xattn = (not unfreeze_decoder) and unfreeze_xattn and 'encoder_attn' in name
+        if train_layer or train_xattn:
+            param.requires_grad = True
+            unfrozen += 1
+    if unfreeze_decoder:
+        print(
+            f"  ✓ Frozen BART encoder, embeddings, and lm_head; "
+            f"training {unfrozen} decoder-layer tensors + EEG encoder"
+        )
+    elif unfreeze_xattn:
+        print(f"  ✓ Frozen BART language model; training {unfrozen} cross-attention tensors + EEG encoder")
+    else:
+        print("  ✓ Frozen entire BART (training EEG encoder and projection only)")
+    return model
+
+
+def build_optimizer(model, config):
+    """Higher LR on the EEG encoder; lower LR on BART decoder layers."""
+    eeg_params = []
+    bart_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if 'decoder.bart' in name or '.bart.' in name:
+            bart_params.append(param)
+        else:
+            eeg_params.append(param)
+    if not eeg_params and not bart_params:
+        raise RuntimeError('No trainable parameters after decoder freeze settings.')
+    base_lr = float(config['training']['learning_rate'])
+    eeg_lr = base_lr * float(config['training'].get('eeg_lr_multiplier', 5.0))
+    param_groups = []
+    if eeg_params:
+        param_groups.append({'params': eeg_params, 'lr': eeg_lr})
+    if bart_params:
+        param_groups.append({'params': bart_params, 'lr': base_lr})
+    optimizer = optim.AdamW(param_groups, weight_decay=config['training']['weight_decay'])
+    print(
+        f"  ✓ Optimizer: AdamW (EEG lr={eeg_lr:g} on {len(eeg_params)} tensors, "
+        f"BART decoder lr={base_lr:g} on {len(bart_params)} tensors)"
+    )
+    return optimizer
+
+
 def create_model(config, device):
     """Create model from config"""
     model_config = config['model']
     strg_config = model_config['strg']
     stre_config = model_config['stre']
     decoder_config = model_config['decoder']
-    
+
     model = GraphEnhancedEEG2Text(
         num_channels=model_config['num_channels'],
         num_frequency_bands=model_config['num_frequency_bands'],
         sampling_rate=250.0,
-        
-        # STRG
-        strg_alpha=strg_config['alpha'],
-        strg_beta=strg_config['beta'],
-        use_spatial_topology=strg_config['use_spatial_topology'],
-        use_functional_connectivity=strg_config['use_functional_connectivity'],
-        
-        # STRE
-        node_dim=stre_config['node_dim'],
+        k_spatial=strg_config.get('k_spatial', 6),
+        k_functional=strg_config.get('k_functional', 6),
+        use_spatial_topology=strg_config.get('use_spatial_topology', True),
+        use_functional_connectivity=strg_config.get('use_functional_connectivity', True),
+        use_frequency_nodes=strg_config.get('use_frequency_nodes', True),
+        dynamic_functional=strg_config.get('dynamic_functional', True),
+        node_dim=stre_config.get('node_dim', 1),
         graph_embed_dim=stre_config['graph_embed_dim'],
         num_gat_layers=stre_config['num_gat_layers'],
         num_gat_heads=stre_config['num_gat_heads'],
@@ -81,19 +210,11 @@ def create_model(config, device):
         num_temporal_heads=stre_config['num_temporal_heads'],
         temporal_ff_dim=stre_config['temporal_ff_dim'],
         temporal_dropout=stre_config['temporal_dropout'],
-        
-        # Decoder
-        vocab_size=decoder_config['vocab_size'],
-        decoder_embed_dim=decoder_config['embed_dim'],
-        num_decoder_layers=decoder_config['num_layers'],
-        num_decoder_heads=decoder_config['num_heads'],
-        decoder_ff_dim=decoder_config['ff_dim'],
-        decoder_dropout=decoder_config['dropout'],
-        max_decoder_length=decoder_config['max_decoder_length'],
-        
+        decoder_pretrained_name=decoder_config.get('pretrained_name', 'facebook/bart-base'),
+        max_decoder_length=decoder_config.get('max_decoder_length', 128),
         device=device
     )
-    
+    configure_pretrained_decoder(model, config)
     return model
 
 
@@ -109,27 +230,20 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config, tokeniz
     pbar = tqdm(dataloader, desc='Training')
     for batch_idx, batch in enumerate(pbar):
         try:
-            # Use eeg_bands dict from preprocessing
-            eeg_bands = {band_name: band_tensor.to(device) for band_name, band_tensor in batch['eeg_bands'].items()}
+            eeg_bands, window_mask, eeg_bands_full, eeg_windows = move_eeg_batch(batch, device)
             text_tokens = batch['text_tokens'].to(device)
-            
-            # CRITICAL FIX: Explicit decoder input/target alignment
-            # decoder_input = text_tokens[:, :-1]  # Teacher forcing input (model does this internally)
-            # targets = text_tokens[:, 1:]         # Next token labels
-            # Note: Model forward() handles the shift internally, but we need to pass full text_tokens
-            
-            # Create padding mask for decoder input (CRITICAL: prevent attention to padding)
-            decoder_input = text_tokens[:, :-1]  # For padding mask calculation
-            pad_token_id = pad_token_id if pad_token_id is not None else 0
-            tgt_key_padding_mask = (decoder_input == pad_token_id)  # (batch_size, tgt_len-1), True where PAD
-            
-            # Forward pass
-            logits, strg_output = model(eeg_bands, text_tokens, tgt_key_padding_mask=tgt_key_padding_mask)
-            
-            # Ensure logits length matches targets (safety check)
-            targets = text_tokens[:, 1:]  # Next token labels
+            pad_token_id = pad_token_id if pad_token_id is not None else 1
+
+            logits, strg_output = model(
+                eeg_bands,
+                text_tokens,
+                window_mask=window_mask,
+                eeg_bands_full=eeg_bands_full,
+                eeg_windows=eeg_windows
+            )
+            # BART logits are aligned with the full label sequence (not GPT-style shift)
+            targets = text_tokens
             if logits.shape[1] != targets.shape[1]:
-                # Truncate or pad logits to match targets
                 min_len = min(logits.shape[1], targets.shape[1])
                 logits = logits[:, :min_len, :]
                 targets = targets[:, :min_len]
@@ -154,15 +268,30 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config, tokeniz
                             token_str = tokenizer.decode([token_id])
                             print(f"    {idx+1}. ID={token_id}, token='{token_str}'")
                     
-                    # Check EEG embeddings
-                    eeg_embeds_check = strg_output['stre_embeds'].squeeze(1)[0].cpu()
+                    # Check EEG embeddings (pre-LayerNorm STRE states distinguish sentences)
+                    eeg_embeds_check = strg_output['stre_embeds'][0, 0].cpu()
                     eeg_norm = torch.norm(eeg_embeds_check).item()
                     print(f"  EEG embedding norm: {eeg_norm:.4f}")
                     if eeg_norm < 1e-6:
                         print(f"  ⚠️  WARNING: EEG embeddings are near zero! This will cause poor predictions.")
+                    nf = strg_output.get('node_features')
+                    if nf is not None:
+                        print(
+                            f"  Node features: mean={nf.mean().item():.4f}, "
+                            f"std={nf.std().item():.4f}"
+                        )
+                    embeds = strg_output.get('stre_embeds')
+                    if embeds is not None and embeds.size(0) > 1:
+                        pooled = embeds.mean(dim=1)
+                        pooled = pooled / (pooled.norm(dim=-1, keepdim=True) + 1e-8)
+                        sim = pooled @ pooled.T
+                        offdiag = sim[~torch.eye(sim.size(0), dtype=torch.bool, device=sim.device)]
+                        print(f"  EEG memory pairwise cosine: {offdiag.mean().item():.3f}")
+                        if offdiag.mean().item() > 0.99:
+                            print("  ⚠️  WARNING: EEG memories are nearly identical across the batch.")
             
             # Compute loss
-            # Targets already computed above (text_tokens[:, 1:])
+            # Targets already computed above (full BART label sequence)
             
             # DIAGNOSTIC: Check targets (first batch only, first epoch only)
             if batch_idx == 0 and epoch == 0 and tokenizer is not None:
@@ -234,71 +363,43 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config, tokeniz
                     if pad_pct > 50:
                         print(f"  ⚠️  WARNING: More than 50% of targets are padding! This might cause issues.")
             
-            # Get text embeddings for contrastive loss (using frozen BERT)
-            text_embeds = strg_output.get('text_embeds')  # (batch_size, graph_embed_dim) from frozen BERT
-            # stre_embeds is (batch_size, 1, graph_embed_dim), squeeze to (batch_size, graph_embed_dim)
-            eeg_embeds = strg_output['stre_embeds'].squeeze(1)  # (batch_size, graph_embed_dim)
-            
+            # Generation loss only (paper: no contrastive or graph-regularization terms)
             loss, loss_dict = criterion(
                 logits=logits,
-                targets=targets,
-                node_embeddings=strg_output['node_features'],
-                adjacency_matrix=strg_output['A'],
-                eeg_embeddings=eeg_embeds,
-                text_embeddings=text_embeds
+                targets=targets
             )
             
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
             
-            # DIAGNOSTIC: Check gradients per component (first batch only)
-            if batch_idx == 0 and epoch % 5 == 0:  # Every 5 epochs
-                print(f"\n{'='*60}")
-                print(f"[GRADIENT CHECK - Epoch {epoch}]")
-                print(f"{'='*60}")
-                
-                # Check each component
-                components = {
-                    'STRG': model.strg,
-                    'STRE (GAT)': model.stre.gat,
-                    'STRE (Temporal)': model.stre.temporal_encoder,
-                    'Decoder': model.decoder
-                }
-                
-                for name, component in components.items():
-                    total_norm = 0.0
-                    param_count = 0
-                    for param in component.parameters():
-                        if param.grad is not None and param.requires_grad:
-                            total_norm += param.grad.norm().item() ** 2
-                            param_count += 1
-                    total_norm = total_norm ** 0.5
-                    
-                    status = "✓ LEARNING" if total_norm > 1e-5 else "⚠️  DEAD"
-                    print(f"{name:20s}: grad_norm={total_norm:10.6f} ({param_count} params) {status}")
-                
-                print(f"{'='*60}\n")
+            # DIAGNOSTIC: Check gradients (first batch only)
+            if batch_idx == 0:
+                total_grad_norm = 0.0
+                param_count = 0
+                zero_grad_count = 0
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        param_grad_norm = param.grad.norm().item()
+                        total_grad_norm += param_grad_norm
+                        param_count += 1
+                        if param_grad_norm < 1e-8:
+                            zero_grad_count += 1
+                    else:
+                        zero_grad_count += 1
+                if param_count > 0:
+                    avg_grad_norm = total_grad_norm / param_count
+                    print(f"  Gradient check: avg_norm={avg_grad_norm:.6f}, zero_grad_params={zero_grad_count}")
+                    if avg_grad_norm < 1e-6:
+                        print(f"  ⚠️  WARNING: Gradients are very small! Model may not be learning.")
+                else:
+                    print(f"  ⚠️  WARNING: No gradients found!")
             
             # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['gradient_clip'])
-            
-            # STRE LEARNING CHECK - temporary diagnostic (first batch, first epoch only)
-            if batch_idx == 0 and epoch == 0:
-                print(f"\n[STRE LEARNING CHECK - Before optimizer.step()]")
-                
-                # Save current STRE embeddings before optimizer step
-                with torch.no_grad():
-                    eeg_embeds_before = strg_output['stre_embeds'].squeeze(1).clone()
-                
-                # Apply one optimizer step (this will happen below, but we check diversity first)
-                if eeg_embeds_before.shape[0] > 1:
-                    std_per_dim = eeg_embeds_before.std(dim=0).mean().item()
-                    print(f"  STRE embedding std per dim (before step): {std_per_dim:.6f}")
-                    if std_per_dim < 0.01:
-                        print(f"  ⚠️  STRE embeddings are NOT diverse! Collapse detected!")
-                    else:
-                        print(f"  ✓ STRE embeddings are diverse")
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad],
+                config['training']['gradient_clip']
+            )
             
             optimizer.step()
             
@@ -324,149 +425,114 @@ def train_epoch(model, dataloader, optimizer, criterion, device, config, tokeniz
     return avg_loss, loss_history
 
 
-def validate(model, dataloader, criterion, device, tokenizer, config):
-    """Validate model"""
-    model.eval()
-    total_loss = 0.0
-    all_references = []
-    all_candidates = []
-    
-    # Debug: Track predictions for printing
-    debug_predictions = []
-    
-    with torch.no_grad():
-        # Track STRE embeddings to check for collapse
-        stre_embeds_list = []
-        
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc='Validating')):
-            # Use eeg_bands dict from preprocessing
-            eeg_bands = {band_name: band_tensor.to(device) for band_name, band_tensor in batch['eeg_bands'].items()}
-            text_tokens = batch['text_tokens'].to(device)
-            texts = batch['text']
-            
-            # CRITICAL FIX: Explicit decoder input/target alignment
-            decoder_input = text_tokens[:, :-1]  # Teacher forcing input
-            targets = text_tokens[:, 1:]         # Next token labels
-            
-            # Create padding mask for decoder input (CRITICAL: prevent attention to padding)
-            pad_token_id_val = tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') and tokenizer.pad_token_id is not None else 0
-            tgt_key_padding_mask = (decoder_input == pad_token_id_val)  # (batch_size, tgt_len-1), True where PAD
-            
-            # Forward pass
-            logits, strg_output = model(eeg_bands, text_tokens, tgt_key_padding_mask=tgt_key_padding_mask)
-            
-            # CRITICAL DIAGNOSTIC: Check STRE embedding diversity (first batch only)
-            if batch_idx == 0:
-                stre_embeds = strg_output['stre_embeds'].squeeze(1)  # (batch_size, graph_embed_dim)
-                stre_embeds_list.append(stre_embeds.cpu())
-                
-                # Check if embeddings are collapsing (all similar)
-                if stre_embeds.shape[0] > 1:
-                    # Compute pairwise cosine similarities
-                    from torch.nn.functional import cosine_similarity
-                    similarities = []
-                    for i in range(stre_embeds.shape[0]):
-                        for j in range(i+1, stre_embeds.shape[0]):
-                            sim = cosine_similarity(stre_embeds[i:i+1], stre_embeds[j:j+1], dim=1).item()
-                            similarities.append(sim)
-                    
-                    avg_sim = sum(similarities) / len(similarities) if similarities else 1.0
-                    max_sim = max(similarities) if similarities else 1.0
-                    
-                    print(f"\n[VALIDATION DEBUG] STRE Embedding Diversity Check:")
-                    print(f"  Batch size: {stre_embeds.shape[0]}")
-                    print(f"  Embedding dim: {stre_embeds.shape[1]}")
-                    print(f"  Average pairwise cosine similarity: {avg_sim:.4f}")
-                    print(f"  Max pairwise cosine similarity: {max_sim:.4f}")
-                    print(f"  Embedding norms: min={stre_embeds.norm(dim=1).min().item():.4f}, max={stre_embeds.norm(dim=1).max().item():.4f}, mean={stre_embeds.norm(dim=1).mean().item():.4f}")
-                    print(f"  Embedding std per dim: mean={stre_embeds.std(dim=0).mean().item():.4f}, max={stre_embeds.std(dim=0).max().item():.4f}")
-                    
-                    if avg_sim > 0.95:
-                        print(f"  ⚠️  CRITICAL: STRE embeddings are collapsing! (avg similarity > 0.95)")
-                        print(f"  ⚠️  This means all EEG inputs produce similar embeddings, causing identical predictions.")
-                    elif avg_sim > 0.8:
-                        print(f"  ⚠️  WARNING: STRE embeddings are too similar (avg similarity > 0.8)")
-                    else:
-                        print(f"  ✓ STRE embeddings are diverse (avg similarity < 0.8)")
-            
-            # Ensure logits length matches targets (safety check)
-            if logits.shape[1] != targets.shape[1]:
-                min_len = min(logits.shape[1], targets.shape[1])
-                logits = logits[:, :min_len, :]
-                targets = targets[:, :min_len]
-            
-            # Compute loss
-            loss, _ = criterion(logits=logits, targets=targets)
-            total_loss += loss.item()
-            
-            # Generate predictions
-            # CRITICAL FIX: Use tokenizer attributes directly (don't guess IDs)
-            if tokenizer is not None:
-                bos_token_id = tokenizer.cls_token_id  # [CLS] for BERT
-                eos_token_id = tokenizer.sep_token_id  # [SEP] for BERT
-                pad_token_id = tokenizer.pad_token_id  # [PAD] for BERT
-            else:
-                # Fallback values if tokenizer not available
-                bos_token_id = 101  # [CLS] token ID for BERT
-                eos_token_id = 102  # [SEP] token ID for BERT
-                pad_token_id = 0    # [PAD] token ID for BERT
-            
-            generated = model.generate(
-                eeg_bands,
-                bos_token_id=bos_token_id,
-                eos_token_id=eos_token_id,
-                pad_token_id=pad_token_id,
-                max_length=config['model']['decoder']['max_decoder_length']
-            )
-            
-            # Decode predictions
-            for i in range(len(texts)):
-                ref = texts[i].split()
-                if hasattr(tokenizer, 'decode'):
-                    # CRITICAL FIX: Add skip_special_tokens=True to remove [CLS], [SEP], [PAD]
-                    cand = tokenizer.decode(generated[i].cpu().tolist(), skip_special_tokens=True).split()
-                    pred_text = ' '.join(cand)
-                else:
-                    cand = [str(t.item()) for t in generated[i]]
-                    pred_text = ' '.join(cand)
-                
-                all_references.append(ref)
-                all_candidates.append(cand)
-                
-                # Debug: Store first few predictions for printing
-                if len(debug_predictions) < 5:
-                    ref_ids = text_tokens[i].cpu().tolist()[:30]
-                    pred_ids = generated[i].cpu().tolist()[:30]
-                    debug_predictions.append((ref_ids, pred_ids, texts[i], pred_text))
-    
-    # Print debug predictions
-    if len(debug_predictions) > 0:
-        print(f"\n[VALIDATION DEBUG] First {len(debug_predictions)} predictions:")
-        for idx, (ref_ids, pred_ids, ref_text, pred_text) in enumerate(debug_predictions):
-            print(f"\n  Example {idx+1}:")
-            print(f"    Reference: {ref_text[:100]}...")
-            print(f"    Prediction: {pred_text[:100]}...")
-            print(f"    Ref tokens (first 20): {ref_ids[:20]}")
-            print(f"    Pred tokens (first 20): {pred_ids[:20]}")
-            
-            # Check if prediction is mostly commas
+def _decode_generated(generated, texts, text_tokens, tokenizer, debug_predictions, all_references, all_candidates):
+    for i in range(len(texts)):
+        ref = texts[i].split()
+        if hasattr(tokenizer, 'decode'):
+            cand = tokenizer.decode(generated[i].cpu().tolist(), skip_special_tokens=True).split()
+            pred_text = ' '.join(cand)
+        else:
+            cand = [str(t.item()) for t in generated[i]]
+            pred_text = ' '.join(cand)
+        all_references.append(ref)
+        all_candidates.append(cand)
+        if len(debug_predictions) < 5:
+            ref_ids = text_tokens[i].cpu().tolist()[:30]
+            pred_ids = generated[i].cpu().tolist()[:30]
+            debug_predictions.append((ref_ids, pred_ids, texts[i], pred_text))
+
+
+def _print_debug_predictions(debug_predictions, all_candidates):
+    if not debug_predictions:
+        return
+    print(f"\n[VALIDATION DEBUG] First {len(debug_predictions)} predictions:")
+    for idx, (ref_ids, pred_ids, ref_text, pred_text) in enumerate(debug_predictions):
+        print(f"\n  Example {idx+1}:")
+        print(f"    Reference: {ref_text[:100]}...")
+        print(f"    Prediction: {pred_text[:100] if pred_text else '<empty>'}...")
+        print(f"    Ref tokens (first 20): {ref_ids[:20]}")
+        print(f"    Pred tokens (first 20): {pred_ids[:20]}")
+        if pred_text:
             comma_count = pred_text.count(',')
             if comma_count > len(pred_text) * 0.5:
                 print(f"    ⚠️  WARNING: Prediction is mostly commas ({comma_count}/{len(pred_text)} chars)")
-            
-            # Check if prediction is repetitive
             pred_tokens = pred_text.split()
-            if len(pred_tokens) > 0:
+            if pred_tokens:
                 most_common = max(set(pred_tokens), key=pred_tokens.count)
                 repetition_ratio = pred_tokens.count(most_common) / len(pred_tokens)
                 if repetition_ratio > 0.5:
                     print(f"    ⚠️  WARNING: Prediction is repetitive ('{most_common}' appears {repetition_ratio:.1%} of the time)")
-    
-    avg_loss = total_loss / len(dataloader)
-    
-    # Compute metrics
-    metrics = evaluate_predictions(all_references, all_candidates, compute_bert=True)
-    
+    if all_candidates:
+        n_empty = sum(1 for c in all_candidates if len(c) == 0)
+        if n_empty:
+            print(
+                f"\n  ⚠️  WARNING: {n_empty}/{len(all_candidates)} predictions "
+                "are empty after removing special tokens."
+            )
+        unique_preds = {' '.join(c) for c in all_candidates}
+        if len(all_candidates) >= 2 and len(unique_preds) == 1:
+            print("\n  ⚠️  WARNING: every validation prediction is identical.")
+            print("  The decoder is ignoring EEG and emitting one high-likelihood sentence.")
+
+
+def validate(model, dataloader, criterion, device, tokenizer, config, compute_generate=False):
+    """Teacher-forced val CE always. Full-set generation metrics only when requested."""
+    model.eval()
+    total_loss = 0.0
+    all_references = []
+    all_candidates = []
+    debug_predictions = []
+    max_len = config['model']['decoder']['max_decoder_length']
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc='Validating')):
+            eeg_bands, window_mask, eeg_bands_full, eeg_windows = move_eeg_batch(batch, device)
+            text_tokens = batch['text_tokens'].to(device)
+            texts = batch['text']
+            targets = text_tokens
+
+            logits, _ = model(
+                eeg_bands,
+                text_tokens,
+                window_mask=window_mask,
+                eeg_bands_full=eeg_bands_full,
+                eeg_windows=eeg_windows
+            )
+            if logits.shape[1] != targets.shape[1]:
+                min_len = min(logits.shape[1], targets.shape[1])
+                logits = logits[:, :min_len, :]
+                targets = targets[:, :min_len]
+            loss, _ = criterion(logits=logits, targets=targets)
+            total_loss += loss.item()
+
+            want_debug = len(debug_predictions) < 5
+            if compute_generate or want_debug:
+                generated = model.generate(
+                    eeg_bands,
+                    max_length=max_len,
+                    beam_size=config.get('evaluation', {}).get('beam_size', 5) if compute_generate else 1,
+                    window_mask=window_mask,
+                    eeg_bands_full=eeg_bands_full,
+                    eeg_windows=eeg_windows
+                )
+                if compute_generate:
+                    _decode_generated(
+                        generated, texts, text_tokens, tokenizer,
+                        debug_predictions, all_references, all_candidates
+                    )
+                elif want_debug:
+                    _decode_generated(
+                        generated, texts, text_tokens, tokenizer,
+                        debug_predictions, [], []
+                    )
+
+    _print_debug_predictions(debug_predictions, all_candidates if compute_generate else [p[3].split() for p in debug_predictions])
+    avg_loss = total_loss / max(len(dataloader), 1)
+    if compute_generate and all_references:
+        metrics = evaluate_predictions(all_references, all_candidates, compute_bert=True)
+    else:
+        metrics = {}
+        print("  (full BLEU/ROUGE skipped this epoch; watching val CE and the 5 debug predictions)")
     return avg_loss, metrics
 
 
@@ -505,17 +571,13 @@ def main():
     print("\n[STAGE 3/7] Initializing tokenizer...")
     # Create tokenizer
     try:
-        tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased', use_fast=True)
-        # CRITICAL FIX: Do NOT override pad_token for BERT - it should already be [PAD]
-        # BERT doesn't have eos_token in the same sense as GPT models
-        assert tokenizer.pad_token_id is not None, "BERT tokenizer should have pad_token_id"
-        # Get actual vocabulary size from tokenizer (BERT-base-uncased has 30522 tokens)
+        decoder_name = config['model']['decoder'].get('pretrained_name', 'facebook/bart-base')
+        tokenizer = AutoTokenizer.from_pretrained(decoder_name, use_fast=True)
         actual_vocab_size = getattr(tokenizer, 'vocab_size', len(tokenizer))
-        # Update config to use tokenizer's vocab size for decoder
         config['model']['decoder']['vocab_size'] = actual_vocab_size
         config['data']['vocab_size'] = actual_vocab_size
-        print(f"  ✓ BERT tokenizer loaded successfully (vocab_size={actual_vocab_size})")
-        print(f"  ✓ pad_token_id={tokenizer.pad_token_id}, cls_token_id={tokenizer.cls_token_id}, sep_token_id={tokenizer.sep_token_id}")
+        print(f"  ✓ {decoder_name} tokenizer loaded (vocab_size={actual_vocab_size})")
+        print(f"  ✓ pad_token_id={tokenizer.pad_token_id}, bos={tokenizer.bos_token_id}, eos={tokenizer.eos_token_id}")
     except Exception as e:
         print(f"  ⚠ Warning: Could not load tokenizer: {e}")
         print("  ⚠ Using simple tokenizer with config vocab_size")
@@ -530,30 +592,11 @@ def main():
     if sanity_test_mode:
         print("  ⚠️  SANITY TEST MODE: Training on 32 samples only to verify pipeline")
     
-    # Create datasets with artifact removal settings from config
-    data_config = config['data']
-    train_dataset = ZuCoDataset(
-        args.data_dir,
-        split='train',
-        max_seq_length=data_config['max_seq_length'],
-        apply_notch_filter=data_config.get('apply_notch_filter', True),
-        notch_freq=data_config.get('notch_freq', 50.0),
-        apply_highpass_filter=data_config.get('apply_highpass_filter', True),
-        highpass_cutoff=data_config.get('highpass_cutoff', 0.5),
-        detect_bad_channels=data_config.get('detect_bad_channels', False),
-        bad_channel_threshold=data_config.get('bad_channel_threshold', 3.0)
-    )
-    val_dataset = ZuCoDataset(
-        args.data_dir,
-        split='val',
-        max_seq_length=data_config['max_seq_length'],
-        apply_notch_filter=data_config.get('apply_notch_filter', True),
-        notch_freq=data_config.get('notch_freq', 50.0),
-        apply_highpass_filter=data_config.get('apply_highpass_filter', True),
-        highpass_cutoff=data_config.get('highpass_cutoff', 0.5),
-        detect_bad_channels=data_config.get('detect_bad_channels', False),
-        bad_channel_threshold=data_config.get('bad_channel_threshold', 3.0)
-    )
+    ds_kwargs = dataset_kwargs_from_config(config)
+    print("  Loading ZuCo once, then splitting in memory (avoids a second full MATLAB pass)...")
+    splits = ZuCoDataset.load_splits(args.data_dir, splits=('train', 'val'), **ds_kwargs)
+    train_dataset = splits['train']
+    val_dataset = splits['val']
     
     # Apply sanity test subset if enabled
     if sanity_test_mode:
@@ -582,23 +625,11 @@ def main():
     print(f"  ✓ Using {actual_num_channels} channels (detected from ZuCo data)")
     
     print("\n[STAGE 5/7] Creating data loaders...")
-    # Use num_workers=0 on Windows to avoid multiprocessing memory issues
-    # On Linux/Mac, you can use num_workers > 0 if you have enough RAM
-    import sys
-    if sys.platform == 'win32':
-        num_workers = 0  # Windows multiprocessing can cause MemoryError
-        print("  ⚠ Using num_workers=0 (Windows compatibility mode to avoid memory issues)")
-    else:
-        num_workers = config.get('num_workers', 0)  # Default to 0 if not specified
-    
-    # Get max EEG length from config to limit memory usage
-    # Default: 20000 time steps (~80 seconds at 250Hz) - prevents memory issues
-    # Original sequences can be 100k+ time steps, which would cause OOM errors when batching
-    max_eeg_length = config['model'].get('max_eeg_length', 20000)
-    # Cap at 50000 to prevent extreme memory usage
-    if max_eeg_length > 50000:
-        max_eeg_length = 50000
-        print(f"  ⚠ Limiting max_eeg_length to 50000 to avoid memory issues")
+    num_workers = resolve_num_workers(config)
+    resolve_batch_size(config, device)
+    print(f"  ✓ DataLoader workers: {num_workers}")
+
+    max_eeg_length = config['model'].get('max_eeg_length', 4000)
     print(f"  ✓ Max EEG sequence length: {max_eeg_length} time steps (longer sequences will be truncated)")
     
     train_loader = DataLoader(
@@ -606,7 +637,8 @@ def main():
         batch_size=config['training']['batch_size'],
         shuffle=True,
         collate_fn=lambda x: collate_fn(x, tokenizer, config['data']['max_seq_length'], max_eeg_length=max_eeg_length),
-        num_workers=num_workers
+        num_workers=num_workers,
+        pin_memory=False
     )
     
     val_loader = DataLoader(
@@ -614,7 +646,8 @@ def main():
         batch_size=config['training']['batch_size'],
         shuffle=False,
         collate_fn=lambda x: collate_fn(x, tokenizer, config['data']['max_seq_length'], max_eeg_length=max_eeg_length),
-        num_workers=num_workers
+        num_workers=num_workers,
+        pin_memory=False
     )
     print(f"  ✓ Train batches: {len(train_loader)}")
     print(f"  ✓ Validation batches: {len(val_loader)}")
@@ -633,6 +666,8 @@ def main():
     
     # Create model
     model = create_model(config, device)
+    if getattr(train_dataset, 'electrode_positions', None) is not None:
+        model.set_electrode_positions(train_dataset.electrode_positions)
     model = model.to(device)
     
     # Count parameters
@@ -642,27 +677,20 @@ def main():
     print(f"  ✓ Total parameters: {total_params:,}")
     print(f"  ✓ Trainable parameters: {trainable_params:,}")
     
-    # Create optimizer
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=config['training']['learning_rate'],
-        weight_decay=config['training']['weight_decay']
-    )
-    print(f"  ✓ Optimizer: AdamW (lr={config['training']['learning_rate']})")
+    optimizer = build_optimizer(model, config)
     
     # Get pad_token_id for loss function (must ignore padding tokens in loss)
-    pad_token_id = tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') and tokenizer.pad_token_id is not None else 0
+    pad_token_id = tokenizer.pad_token_id if tokenizer is not None and tokenizer.pad_token_id is not None else 1
     
     # Create loss function
     criterion = CompositeLoss(
         lambda_smooth=config['training']['lambda_smooth'],
         lambda_contrastive=config['training']['lambda_contrastive'],
-        lambda_diversity=config['training'].get('lambda_diversity', 0.01),  # Diversity loss to prevent STRE collapse
         vocab_size=config['model']['decoder']['vocab_size'],
         ignore_index=pad_token_id  # CRITICAL: Ignore padding tokens (0) in loss calculation
     )
     # Verify ignore_index is correctly set (CRITICAL DEBUG CHECK)
-    print(f"  ✓ Loss function: Composite (λ_smooth={config['training']['lambda_smooth']}, λ_contrastive={config['training']['lambda_contrastive']}, λ_diversity={config['training'].get('lambda_diversity', 0.01)})")
+    print(f"  ✓ Loss function: Composite (λ_smooth={config['training']['lambda_smooth']}, λ_contrastive={config['training']['lambda_contrastive']})")
     print(f"  ✓ CE ignore_index = {criterion.ce_loss.ignore_index}")
     print(f"  ✓ pad_token_id = {pad_token_id}")
     if criterion.ce_loss.ignore_index != pad_token_id:
@@ -699,6 +727,8 @@ def main():
     # Training loop
     training_log = []
     patience_counter = 0
+    best_val_metrics = {}
+    best_epoch = 0
     
     for epoch in range(start_epoch, config['training']['num_epochs']):
         print(f'\nEpoch {epoch+1}/{config["training"]["num_epochs"]}')
@@ -708,9 +738,17 @@ def main():
         print(f'Train Loss: {train_loss:.4f}')
         
         # Validate
-        val_loss, val_metrics = validate(model, val_loader, criterion, device, tokenizer, config)
+        eval_every = int(config['evaluation'].get('eval_generate_every', 5))
+        compute_generate = ((epoch + 1) % eval_every == 0) or epoch == 0
+        val_loss, val_metrics = validate(
+            model, val_loader, criterion, device, tokenizer, config,
+            compute_generate=compute_generate
+        )
         print(f'Val Loss: {val_loss:.4f}')
-        print(f'Val Metrics: {json.dumps({k: f"{v:.2f}" for k, v in val_metrics.items()}, indent=2)}')
+        if val_metrics:
+            print(f'Val Metrics: {json.dumps({k: f"{v:.2f}" for k, v in val_metrics.items()}, indent=2)}')
+        else:
+            print('Val Metrics: skipped (see debug predictions; full BLEU every eval_generate_every epochs)')
         
         # Log training metrics
         log_entry = {
@@ -729,8 +767,8 @@ def main():
                 sample_batch = next(iter(val_loader))
                 sample_eeg_bands = {k: v[:1].to(device) for k, v in sample_batch['eeg_bands'].items()}
                 with torch.no_grad():
-                    A, _, _ = model.strg(sample_eeg_bands)
-                    A_np = A[0].cpu().numpy()
+                    strg_out = model.strg(sample_eeg_bands)
+                    A_np = strg_out['edge_mask'][0, 0].cpu().numpy()
                     save_adjacency_heatmap(
                         A_np,
                         os.path.join(viz_dir, f'adjacency_epoch_{epoch+1}.png'),
@@ -741,14 +779,20 @@ def main():
             except Exception as e:
                 print(f"Warning: Could not save visualization: {e}")
         
-        # Save checkpoint
-        if val_loss < best_val_loss:
+        # Save checkpoint. Compare against the previous best *before* updating it,
+        # otherwise patience increments on the same epoch that just improved.
+        previous_best = best_val_loss
+        min_delta = config['training'].get('early_stopping_min_delta', 0.001)
+        if val_loss < previous_best:
             best_val_loss = val_loss
+            best_val_metrics = dict(val_metrics)
+            best_epoch = epoch + 1
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_val_loss': best_val_loss,
+                'val_metrics': best_val_metrics,
                 'config': config
             }
             torch.save(checkpoint, os.path.join(args.checkpoint_dir, 'best_model.pt'))
@@ -768,11 +812,7 @@ def main():
         # Early stopping check
         if config['training'].get('early_stopping', False):
             patience = config['training'].get('early_stopping_patience', 5)
-            min_delta = config['training'].get('early_stopping_min_delta', 0.001)
-            
-            # Track best validation loss
-            if val_loss < best_val_loss - min_delta:
-                best_val_loss = val_loss
+            if val_loss < previous_best - min_delta:
                 patience_counter = 0
             else:
                 patience_counter += 1
@@ -791,11 +831,15 @@ def main():
     print(f"  ✓ Training log saved to: {log_path}")
     print(f"  ✓ Best model saved to: {os.path.join(args.checkpoint_dir, 'best_model.pt')}")
     print(f"  ✓ Total epochs trained: {len(training_log)}")
-    print(f"  ✓ Best validation loss: {best_val_loss:.4f}")
-    if len(training_log) > 0:
+    print(f"  ✓ Best validation loss: {best_val_loss:.4f} (epoch {best_epoch})")
+    if best_val_metrics:
+        print("  ✓ Best-checkpoint validation metrics:")
+        for metric, value in best_val_metrics.items():
+            print(f"      - {metric}: {value:.4f}")
+    elif training_log:
         final_metrics = training_log[-1].get('val_metrics', {})
         if final_metrics:
-            print(f"  ✓ Final validation metrics:")
+            print("  ✓ Last-epoch validation metrics:")
             for metric, value in final_metrics.items():
                 print(f"      - {metric}: {value:.4f}")
     print("="*70)

@@ -2,96 +2,92 @@
 
 # Dataset
 data:
-  data_dir: "data"  # Directory containing ZuCo_1.0/ and ZuCo_2.0/ subdirectories
+  data_dir: "data"
   train_split: 0.8
   val_split: 0.1
   test_split: 0.1
-  max_seq_length: 32
-  vocab_size: 10000
-  
-  # Artifact removal settings
-  apply_notch_filter: true      # Remove power line noise (50/60 Hz)
-  notch_freq: 50.0               # Line noise frequency (50 Hz EU, 60 Hz US)
-  apply_highpass_filter: true    # Remove slow drifts
-  highpass_cutoff: 0.5           # High-pass cutoff in Hz
-  detect_bad_channels: false     # Optional: detect and interpolate bad channels
-  bad_channel_threshold: 3.0     # Standard deviations for bad channel detection
-  
+  split_seed: 42
+  max_seq_length: 64
+  vocab_size: 50265
+
+  apply_notch_filter: true
+  notch_freq: 50.0
+  apply_highpass_filter: true
+  highpass_cutoff: 0.5
+  detect_bad_channels: false
+  bad_channel_threshold: 3.0
+
+  # Sentence EEG is divided into W windows before STRG construction
+  window_size_sec: 1.0
+  window_stride_sec: 1.0
+  max_windows: 16
+
 # Model parameters
 model:
-  # EEG parameters
-  num_channels: 64  # Number of EEG channels (will be overridden by actual ZuCo data)
-  num_frequency_bands: 5  # delta, theta, alpha, beta, gamma
+  num_channels: 64
+  num_frequency_bands: 5
   time_steps: 1000
-  
-  # Graph parameters
+  # 16 windows × 1 s × 250 Hz. Keeping 80 s copies of every sentence OOMs a laptop.
+  max_eeg_length: 4000
+
   strg:
-    alpha: 0.5  # Weight for spatial adjacency
-    beta: 0.5   # Weight for functional connectivity
+    k_spatial: 6
+    k_functional: 6
     use_spatial_topology: true
     use_functional_connectivity: true
-    
-  # STRE parameters
+    use_frequency_nodes: true
+    dynamic_functional: true
+
   stre:
-    node_dim: 1  # Bandpower is scalar feature per node
+    node_dim: 1
     graph_embed_dim: 256
     num_gat_layers: 2
     num_gat_heads: 4
     gat_dropout: 0.1
-    
-    # Temporal Transformer
     num_temporal_layers: 4
     num_temporal_heads: 8
     temporal_ff_dim: 512
     temporal_dropout: 0.1
-    
-  # Decoder parameters
+
   decoder:
-    vocab_size: 10000
-    embed_dim: 256
-    num_layers: 4
-    num_heads: 8
-    ff_dim: 512
-    dropout: 0.1
-    max_decoder_length: 128
+    pretrained_name: "facebook/bart-base"
+    max_decoder_length: 64
+    # Fine-tuning all of BART on 4k sentences collapses generation to one training line.
+    freeze_pretrained: true
+    freeze_encoder_only: true
+    unfreeze_decoder_layers: true
+    unfreeze_cross_attention: true
 
 # Training
 training:
-  learning_rate: 5.0e-4  # Increase from 1e-4
-  early_stopping: false  # Disable it
-  num_epochs: 100  # Train longer
-  
-training:
-  batch_size: 16
-  num_epochs: 100  # Train longer
-  learning_rate: 5.0e-4  # Increase from 1e-4
+  batch_size: 8
+  num_epochs: 100
+  learning_rate: 1.0e-5
+  # STRG/STRE/projection learn faster than BART decoder
+  eeg_lr_multiplier: 20.0
   weight_decay: 1e-5
   warmup_steps: 1000
   gradient_clip: 1.0
-  
-  # Loss weights
-  lambda_smooth: 0.05  # Graph smoothness regularization
-  lambda_contrastive: 0.05 #Contrastive alignment loss (DISABLED initially - enable after CE learns words)
-  lambda_diversity: 1.0  # STRE embedding diversity loss (prevents mode collapse)
-  
-  # Overfitting control
-  dropout: 0.1  # Applied in model layers
-  early_stopping: true  # Enable it
-  early_stopping_patience: 5  # Stop if no improvement for N epochs
+  dropout: 0.1
+  # Paper uses teacher-forced generation loss only
+  lambda_smooth: 0.0
+  lambda_contrastive: 0.0
+  early_stopping: true
+  early_stopping_patience: 10
   early_stopping_min_delta: 0.001
-  
   checkpoint_dir: "checkpoints"
   save_every: 5
   log_every: 100
-  visualize_every: 10  # Generate comprehensive STRG visualizations every N epochs (0 to disable)
+  visualize_every: 10
 
 # Evaluation
 evaluation:
-  metrics: ["bleu", "rouge", "bertscore"]
+  metrics: ["bleu", "rouge", "wer", "bertscore"]
   beam_size: 5
+  eval_generate_every: 5
 
 # Hardware
-device: "cuda"  # or "cpu"
-num_workers: 4
+device: "cuda"
+# In-memory ZuCo cannot be forked: each worker copies ~all EEG arrays.
+num_workers: 0
 seed: 42
-
