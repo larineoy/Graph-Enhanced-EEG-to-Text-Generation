@@ -1,45 +1,37 @@
 """
-Graph-Enhanced EEG-to-Text Decoding Model
-Main model that integrates STRG, STRE, and Transformer Decoder
-
-Uses preprocessed eeg_bands from preprocessing pipeline.
+Graph-Enhanced EEG-to-Text model: STRG → STRE → pretrained BART decoder.
 """
 
+from typing import Dict, Optional
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-from typing import Dict, Optional
-from transformers import AutoModel
+
+from .decoder import BartEEGDecoder
 from .strg import STRG
 from .stre import STRE
-from .decoder import TransformerDecoder
 
 
 class GraphEnhancedEEG2Text(nn.Module):
     """
-    Graph-Enhanced EEG-to-Text Decoding Framework
-    
-    Integrates:
-    1. STRG: Spectro-Topographic Relational Graph construction
-    2. STRE: Spatio-Temporal Relational Embeddings
-    3. Transformer Decoder: Text generation
+    STRG constructs per-window relational graphs.
+    STRE produces EEG memory M.
+    A pretrained BART decoder generates text from M.
     """
-    
+
     def __init__(
         self,
-        # EEG parameters
         num_channels: int = 64,
         num_frequency_bands: int = 5,
-        sampling_rate: float = 250.0,  # Not used anymore but kept for compatibility
-        
-        # STRG parameters
-        strg_alpha: float = 0.5,
-        strg_beta: float = 0.5,
+        sampling_rate: float = 250.0,
+        k_spatial: int = 6,
+        k_functional: int = 6,
         use_spatial_topology: bool = True,
         use_functional_connectivity: bool = True,
-        
-        # STRE parameters
-        node_dim: int = 1,  # Bandpower is scalar feature per node
+        use_frequency_nodes: bool = True,
+        dynamic_functional: bool = True,
+        node_dim: int = 1,
         graph_embed_dim: int = 256,
         num_gat_layers: int = 2,
         num_gat_heads: int = 4,
@@ -48,40 +40,37 @@ class GraphEnhancedEEG2Text(nn.Module):
         num_temporal_heads: int = 8,
         temporal_ff_dim: int = 512,
         temporal_dropout: float = 0.1,
-        
-        # Decoder parameters
-        vocab_size: int = 10000,
-        decoder_embed_dim: int = 256,
-        num_decoder_layers: int = 4,
-        num_decoder_heads: int = 8,
-        decoder_ff_dim: int = 512,
-        decoder_dropout: float = 0.1,
+        decoder_pretrained_name: str = 'facebook/bart-base',
         max_decoder_length: int = 128,
-        
-        # Device
-        device: str = 'cuda'
+        device: str = 'cuda',
+        **deprecated
     ):
-        super(GraphEnhancedEEG2Text, self).__init__()
-        
+        super().__init__()
+        del deprecated
         self.num_channels = num_channels
         self.num_frequency_bands = num_frequency_bands
         self.sampling_rate = sampling_rate
         self.device = device
-        
-        # STRG construction
-        # electrode_positions will be set after model creation if available from ZuCo
+        self.max_decoder_length = max_decoder_length
+        self.use_frequency_nodes = use_frequency_nodes
+
+        if not use_frequency_nodes:
+            node_dim = num_frequency_bands
+
         self.strg = STRG(
             num_channels=num_channels,
             num_frequency_bands=num_frequency_bands,
-            alpha=strg_alpha,
-            beta=strg_beta,
+            k_spatial=k_spatial,
+            k_functional=k_functional,
             use_spatial_topology=use_spatial_topology,
             use_functional_connectivity=use_functional_connectivity,
+            use_frequency_nodes=use_frequency_nodes,
+            dynamic_functional=dynamic_functional,
             device=device,
-            electrode_positions=None  # Will be set from dataset if available
+            electrode_positions=None
         )
-        
-        # STRE generation
+        node_dim = self.strg.node_dim
+
         self.stre = STRE(
             node_dim=node_dim,
             graph_embed_dim=graph_embed_dim,
@@ -93,285 +82,105 @@ class GraphEnhancedEEG2Text(nn.Module):
             temporal_ff_dim=temporal_ff_dim,
             temporal_dropout=temporal_dropout
         )
-        
-        # Project STRE embeddings to decoder dimension if needed
-        if graph_embed_dim != decoder_embed_dim:
-            self.stre_proj = nn.Linear(graph_embed_dim, decoder_embed_dim)
-        else:
-            self.stre_proj = nn.Identity()
-        
-        # Transformer decoder
-        self.decoder = TransformerDecoder(
-            vocab_size=vocab_size,
-            embed_dim=decoder_embed_dim,
-            num_layers=num_decoder_layers,
-            num_heads=num_decoder_heads,
-            ff_dim=decoder_ff_dim,
-            dropout=decoder_dropout,
-            max_decoder_length=max_decoder_length
-        )
-        
-        # Text encoder for contrastive loss (FROZEN BERT)
-        # Use frozen pretrained BERT model for contrastive loss
-        self.frozen_text_model = AutoModel.from_pretrained('bert-base-uncased')
-        # Freeze all parameters in BERT
-        for param in self.frozen_text_model.parameters():
-            param.requires_grad = False
-        self.frozen_text_model.eval()  # Set to eval mode (disables dropout, etc.)
-        
-        # Project BERT embeddings (768-dim) to graph_embed_dim
-        bert_dim = 768
-        if bert_dim != graph_embed_dim:
-            self.text_proj = nn.Linear(bert_dim, graph_embed_dim)
-        else:
-            self.text_proj = nn.Identity()
-    
+
+        self.decoder = BartEEGDecoder(pretrained_name=decoder_pretrained_name)
+        self.stre_proj = nn.Linear(graph_embed_dim, self.decoder.d_model)
+        self.memory_norm = nn.LayerNorm(self.decoder.d_model)
+
     def set_electrode_positions(self, electrode_positions: torch.Tensor):
-        """
-        Set electrode positions from ZuCo dataset chanlocs.
-        Rebuilds spatial adjacency matrix with actual positions.
-        
-        Args:
-            electrode_positions: Tensor of shape (num_channels, 3) with X, Y, Z coordinates
-        """
-        if electrode_positions is not None:
-            # Convert to tensor if numpy array
-            if isinstance(electrode_positions, np.ndarray):
-                electrode_positions = torch.from_numpy(electrode_positions).float()
-            
-            # Update STRG with actual positions
-            self.strg.electrode_positions = electrode_positions
-            # Rebuild spatial adjacency with actual positions
-            self.strg.register_buffer('A_spatial', self.strg._build_spatial_adjacency())
-    
-    def encode_text(self, text_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Encode text tokens using frozen BERT model for contrastive loss.
-        
-        Args:
-            text_tokens: Token IDs of shape (batch_size, seq_len)
-            
-        Returns:
-            text_embeds: Sentence-level text embeddings of shape (batch_size, graph_embed_dim)
-        """
-        # Use frozen BERT model (no gradients)
-        with torch.no_grad():
-            outputs = self.frozen_text_model(text_tokens)
-            # Use [CLS] token (first token) for sentence-level representation
-            text_embeds = outputs.last_hidden_state[:, 0, :]  # (batch_size, 768)
-        
-        # Project to graph embedding dimension
-        text_embeds = self.text_proj(text_embeds)  # (batch_size, graph_embed_dim)
-        
-        return text_embeds
-    
+        if electrode_positions is None:
+            return
+        if isinstance(electrode_positions, np.ndarray):
+            electrode_positions = torch.from_numpy(electrode_positions).float()
+        self.strg.set_electrode_positions(electrode_positions)
+
+    def encode(
+        self,
+        eeg_bands: Dict[str, torch.Tensor],
+        window_mask: Optional[torch.Tensor] = None,
+        eeg_bands_full: Optional[Dict[str, torch.Tensor]] = None,
+        eeg_windows: Optional[torch.Tensor] = None
+    ):
+        strg_out = self.strg(
+            eeg_bands,
+            eeg_bands_full=eeg_bands_full,
+            eeg_windows=eeg_windows
+        )
+        stre_embeds = self.stre(
+            strg_out['edge_mask'],
+            strg_out['node_features'],
+            strg_out['edge_attr'],
+            window_mask=window_mask
+        )
+        memory = self.memory_norm(self.stre_proj(stre_embeds))
+        encoder_attention_mask = window_mask
+        if encoder_attention_mask is None:
+            encoder_attention_mask = torch.ones(
+                memory.shape[:2], device=memory.device, dtype=memory.dtype
+            )
+        return memory, encoder_attention_mask, strg_out, stre_embeds
+
     def forward(
         self,
         eeg_bands: Dict[str, torch.Tensor],
         tgt_tokens: Optional[torch.Tensor] = None,
         tgt_mask: Optional[torch.Tensor] = None,
-        tgt_key_padding_mask: Optional[torch.Tensor] = None
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        window_mask: Optional[torch.Tensor] = None,
+        eeg_bands_full: Optional[Dict[str, torch.Tensor]] = None,
+        eeg_windows: Optional[torch.Tensor] = None
     ):
-        """
-        Forward pass
-        
-        Args:
-            eeg_bands: Dictionary of frequency bands, each of shape (batch_size, num_channels, time_steps)
-                Keys: 'delta', 'theta', 'alpha', 'beta', 'gamma'
-            tgt_tokens: Target text tokens for training (batch_size, tgt_len)
-            tgt_mask: Causal mask for decoder (optional)
-            
-        Returns:
-            If training (tgt_tokens provided):
-                logits: Decoder output logits (batch_size, tgt_len-1, vocab_size)
-                strg_output: STRG outputs (A, node_features, bandpowers, stre_embeds, text_embeds) for loss computation
-            If inference:
-                memory: STRE embeddings (batch_size, 1, decoder_embed_dim)
-                strg_output: STRG outputs
-        """
-        # Step 1: Construct STRG from preprocessed frequency bands
-        A, node_features, bandpowers = self.strg(eeg_bands)
-        # A: (batch_size, num_nodes, num_nodes)
-        # node_features: (batch_size, num_nodes, node_dim) where node_dim=1
-        # bandpowers: (batch_size, num_channels, num_frequency_bands)
-        
-        # Reshape for STRE: treat as single temporal window (sentence-level alignment)
-        # Note: The paper mentions "word or sentence level windows aligned with text"
-        # Current implementation uses sentence-level windows, where each sentence corresponds to one EEG segment
-        # STRE architecture supports multiple temporal windows if word-level segmentation is desired in future
-        A_windowed = A.unsqueeze(1)  # (batch_size, 1, num_nodes, num_nodes)
-        node_features_windowed = node_features.unsqueeze(1)  # (batch_size, 1, num_nodes, node_dim)
-        
-        # Step 2: Generate STRE embeddings
-        # STRE processes temporal sequence: Z_{1:T} = Transformer(h_{1:T})
-        # For sentence-level: T=1 (single window per sentence)
-        stre_embeds = self.stre(A_windowed, node_features_windowed)  # (batch_size, 1, graph_embed_dim)
-        
-        # Project to decoder dimension
-        memory = self.stre_proj(stre_embeds)  # (batch_size, 1, decoder_embed_dim)
-        
-        # Step 3: Decode to text
-        if tgt_tokens is not None:
-            # Training mode
-            # Shift tokens for teacher forcing
-            tgt_input = tgt_tokens[:, :-1]  # Remove last token (decoder input)
-            # tgt_output = tgt_tokens[:, 1:]  # For reference (targets in loss)
-            
-            # Generate causal mask
-            if tgt_mask is None:
-                tgt_len = tgt_input.shape[1]
-                tgt_mask = self.decoder.generate_mask(tgt_len, self.device)
-            
-            # Create padding mask for decoder input (CRITICAL: prevent attention to padding)
-            if tgt_key_padding_mask is None:
-                # Create mask: True where token is PAD (should be masked)
-                pad_token_id = 0  # BERT pad_token_id
-                tgt_key_padding_mask = (tgt_input == pad_token_id)  # (batch_size, tgt_len)
-            
-            logits = self.decoder(
-                tgt=tgt_input,
-                memory=memory,
-                tgt_mask=tgt_mask,
-                tgt_key_padding_mask=tgt_key_padding_mask
-            )
-            # logits: (batch_size, tgt_len-1, vocab_size)
-            
-            # Encode text for contrastive loss
-            text_embeds = self.encode_text(tgt_tokens)  # (batch_size, graph_embed_dim)
-            
-            return logits, {
-                'A': A,
-                'node_features': node_features,
-                'bandpowers': bandpowers,
-                'stre_embeds': stre_embeds,
-                'text_embeds': text_embeds
-            }
-        else:
-            # Inference mode - return memory for autoregressive generation
-            return memory, {
-                'A': A,
-                'node_features': node_features,
-                'bandpowers': bandpowers,
-                'stre_embeds': stre_embeds
-            }
-    
+        memory, encoder_attention_mask, strg_out, stre_embeds = self.encode(
+            eeg_bands,
+            window_mask=window_mask,
+            eeg_bands_full=eeg_bands_full,
+            eeg_windows=eeg_windows
+        )
+
+        extras = {
+            'stre_embeds': stre_embeds,
+            'memory': memory,
+            'encoder_attention_mask': encoder_attention_mask,
+            'node_features': strg_out.get('node_features')
+        }
+
+        if tgt_tokens is None:
+            return memory, extras
+
+        logits = self.decoder(
+            tgt=tgt_tokens,
+            memory=memory,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            encoder_attention_mask=encoder_attention_mask,
+            tgt_mask=tgt_mask
+        )
+        return logits, extras
+
     def generate(
         self,
         eeg_bands: Dict[str, torch.Tensor],
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
-        pad_token_id: int = 0,
+        bos_token_id: int = None,
+        eos_token_id: int = None,
+        pad_token_id: int = None,
         max_length: int = 128,
-        beam_size: int = 5
+        beam_size: int = 5,
+        window_mask: Optional[torch.Tensor] = None,
+        eeg_bands_full: Optional[Dict[str, torch.Tensor]] = None,
+        eeg_windows: Optional[torch.Tensor] = None,
+        **kwargs
     ):
-        """
-        Generate text from preprocessed EEG frequency bands
-        
-        Args:
-            eeg_bands: Dictionary of frequency bands, each of shape (batch_size, num_channels, time_steps)
-                Keys: 'delta', 'theta', 'alpha', 'beta', 'gamma'
-            bos_token_id: Beginning of sequence token ID
-            eos_token_id: End of sequence token ID
-            pad_token_id: Padding token ID
-            max_length: Maximum generation length
-            beam_size: Beam search size (not used in greedy generation)
-            
-        Returns:
-            generated_tokens: Generated token sequences (batch_size, seq_len)
-        """
+        del bos_token_id, eos_token_id, pad_token_id
         self.eval()
-        
-        # Get first band to determine batch size and device
-        first_band = list(eeg_bands.values())[0]
-        batch_size = first_band.shape[0]
-        device = first_band.device
-        
-        # Get STRE embeddings (memory)
-        memory, _ = self.forward(eeg_bands)
-        
-        # DIAGNOSTIC: Check memory (STRE embeddings)
-        if batch_size == 1:
-            memory_norm = torch.norm(memory[0]).item()
-            memory_std = memory[0].std().item()
-            print(f"\n[GEN DEBUG] Memory (STRE embeddings):")
-            print(f"  Memory norm: {memory_norm:.4f}")
-            print(f"  Memory std: {memory_std:.4f}")
-            if memory_norm < 1e-6:
-                print(f"  ⚠️  WARNING: Memory is near zero! Model can't generate meaningful text.")
-            if memory_std < 1e-6:
-                print(f"  ⚠️  WARNING: Memory is constant! Model can't generate diverse text.")
-        
-        # Simple greedy generation (can be extended to beam search)
-        generated = torch.full(
-            (batch_size, 1),
-            bos_token_id,
-            dtype=torch.long,
-            device=device
+        memory, encoder_attention_mask, _, _ = self.encode(
+            eeg_bands,
+            window_mask=window_mask,
+            eeg_bands_full=eeg_bands_full,
+            eeg_windows=eeg_windows
         )
-        
-        with torch.no_grad():
-            # Track which sequences have finished (reached EOS)
-            finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-            
-            # Repetition penalty: track last N tokens to prevent immediate repeats
-            last_tokens = []  # Track last few tokens per sequence
-            repetition_penalty = 1.2  # Penalize repeated tokens
-            
-            for step in range(max_length - 1):
-                tgt_mask = self.decoder.generate_mask(generated.shape[1], device)
-                logits = self.decoder(
-                    tgt=generated,
-                    memory=memory,
-                    tgt_mask=tgt_mask
-                )
-                
-                # Get next token (greedy)
-                # Mask out padding token to prevent generating it (from step 1 onwards)
-                logits_last = logits[:, -1, :].clone()  # (batch_size, vocab_size)
-                logits_last[:, pad_token_id] = float('-inf')  # Mask padding token
-                
-                # Apply repetition penalty (simple: penalize if same token appears in last 3 positions)
-                if step > 0 and len(last_tokens) > 0:
-                    for b in range(batch_size):
-                        if len(last_tokens[b]) >= 2:
-                            # If last token repeats, apply penalty
-                            last_token = last_tokens[b][-1]
-                            if logits_last[b, last_token] > float('-inf'):
-                                logits_last[b, last_token] = logits_last[b, last_token] / repetition_penalty
-                
-                # DIAGNOSTIC: Check logits (first batch, first few steps only)
-                if step < 3 and batch_size == 1:
-                    top5_logits, top5_indices = torch.topk(logits_last[0], 5)
-                    print(f"\n[GEN DEBUG] Step {step}:")
-                    print(f"  Logits range: [{logits_last[0].min().item():.2f}, {logits_last[0].max().item():.2f}]")
-                    print(f"  Logits std: {logits_last[0].std().item():.2f}")
-                    print(f"  Top 5 token IDs: {top5_indices.tolist()}")
-                    print(f"  Top 5 logits: {top5_logits.tolist()}")
-                    # Check if all logits are similar (degenerate)
-                    if logits_last[0].std().item() < 0.1:
-                        print(f"  ⚠️  WARNING: Logits are too uniform (std={logits_last[0].std().item():.2f})!")
-                
-                # For finished sequences, keep generating EOS
-                next_token = logits_last.argmax(dim=-1, keepdim=True)
-                next_token[finished] = eos_token_id
-                
-                generated = torch.cat([generated, next_token], dim=1)
-                
-                # Update last tokens tracking
-                if len(last_tokens) < batch_size:
-                    last_tokens = [[] for _ in range(batch_size)]
-                for b in range(batch_size):
-                    token_val = next_token[b, 0].item()
-                    last_tokens[b].append(token_val)
-                    if len(last_tokens[b]) > 3:  # Keep only last 3 tokens
-                        last_tokens[b] = last_tokens[b][-3:]
-                
-                # Mark sequences that just generated EOS
-                finished = finished | (next_token.squeeze(1) == eos_token_id)
-                
-                # Stop if all sequences have reached EOS
-                if finished.all():
-                    break
-        
-        return generated
-
+        return self.decoder.generate(
+            memory=memory,
+            encoder_attention_mask=encoder_attention_mask,
+            max_length=max_length,
+            num_beams=beam_size,
+            **kwargs
+        )

@@ -1,19 +1,21 @@
 """
-Sequential baseline model for ablation study (no graph structure)
+No-graph ablation: the same windowed frequency features without relational structure.
 """
+
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-from typing import Dict, Optional
-from .decoder import TransformerDecoder
+
+from .decoder import BartEEGDecoder
 
 
 class SequentialEEG2Text(nn.Module):
     """
-    Sequential baseline model without graph structure
-    Averages frequency bands and uses Transformer encoder-decoder
+    Sequence encoder over windowed bandpower vectors, then the same pretrained
+    BART decoder used by the full model.
     """
-    
+
     def __init__(
         self,
         num_channels: int,
@@ -23,20 +25,20 @@ class SequentialEEG2Text(nn.Module):
         num_heads: int = 8,
         ff_dim: int = 512,
         dropout: float = 0.1,
-        vocab_size: int = 10000,
+        decoder_pretrained_name: str = 'facebook/bart-base',
         max_decoder_length: int = 128,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        **deprecated
     ):
-        super(SequentialEEG2Text, self).__init__()
-        
+        super().__init__()
+        del deprecated
         self.num_channels = num_channels
         self.num_frequency_bands = num_frequency_bands
         self.device = device
-        
-        # Project frequency bands to embedding dimension
-        self.band_proj = nn.Linear(num_channels, embed_dim)
-        
-        # Transformer encoder for temporal modeling
+        self.max_decoder_length = max_decoder_length
+
+        self.input_dim = num_channels * num_frequency_bands
+        self.band_proj = nn.Linear(self.input_dim, embed_dim)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -45,111 +47,80 @@ class SequentialEEG2Text(nn.Module):
             batch_first=True
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        # Project to decoder dimension
-        self.encoder_proj = nn.Linear(embed_dim, embed_dim)
-        
-        # Transformer decoder
-        self.decoder = TransformerDecoder(
-            vocab_size=vocab_size,
-            embed_dim=embed_dim,
-            num_layers=num_layers,
-            num_heads=num_heads,
-            ff_dim=ff_dim,
-            dropout=dropout,
-            max_decoder_length=max_decoder_length
+        self.decoder = BartEEGDecoder(pretrained_name=decoder_pretrained_name)
+        self.memory_proj = nn.Linear(embed_dim, self.decoder.d_model)
+        self.memory_norm = nn.LayerNorm(self.decoder.d_model)
+
+    def _windowed_features(self, eeg_bands: Dict[str, torch.Tensor]) -> torch.Tensor:
+        bands = []
+        for name in ['delta', 'theta', 'alpha', 'beta', 'gamma']:
+            if name not in eeg_bands:
+                continue
+            x = eeg_bands[name]
+            if x.dim() == 3:
+                x = x.unsqueeze(1)
+            bands.append(torch.var(x, dim=-1))
+        if not bands:
+            raise ValueError("No frequency bands found in eeg_bands")
+        stacked = torch.stack(bands, dim=-1)  # (B, W, C, F)
+        return stacked.reshape(stacked.shape[0], stacked.shape[1], -1)
+
+    def encode(
+        self,
+        eeg_bands: Dict[str, torch.Tensor],
+        window_mask: Optional[torch.Tensor] = None
+    ):
+        features = self._windowed_features(eeg_bands)
+        encoded = self.encoder(
+            self.band_proj(features),
+            src_key_padding_mask=(window_mask == 0) if window_mask is not None else None
         )
-    
+        memory = self.memory_norm(self.memory_proj(encoded))
+        if window_mask is None:
+            window_mask = torch.ones(memory.shape[:2], device=memory.device, dtype=memory.dtype)
+        return memory, window_mask
+
     def forward(
         self,
         eeg_bands: Dict[str, torch.Tensor],
         tgt_tokens: Optional[torch.Tensor] = None,
-        tgt_mask: Optional[torch.Tensor] = None
+        tgt_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        window_mask: Optional[torch.Tensor] = None,
+        **unused
     ):
-        """
-        Args:
-            eeg_bands: Dictionary of frequency bands
-            tgt_tokens: Target tokens for training
-            tgt_mask: Causal mask
-        """
-        batch_size = list(eeg_bands.values())[0].shape[0]
-        
-        # Average across frequency bands: (batch, C, T) -> (batch, T, C)
-        band_list = []
-        for band_name in ['delta', 'theta', 'alpha', 'beta', 'gamma']:
-            if band_name in eeg_bands:
-                band_data = eeg_bands[band_name]  # (batch, C, T)
-                band_list.append(band_data)
-        
-        # Stack and average: (batch, num_bands, C, T) -> (batch, C, T)
-        if len(band_list) > 0:
-            all_bands = torch.stack(band_list, dim=1)  # (batch, num_bands, C, T)
-            avg_eeg = torch.mean(all_bands, dim=1)  # (batch, C, T)
-        else:
-            raise ValueError("No frequency bands found in eeg_bands")
-        
-        # Transpose to (batch, T, C) for sequence processing
-        avg_eeg = avg_eeg.transpose(1, 2)  # (batch, T, C)
-        
-        # Project to embedding dimension
-        eeg_embed = self.band_proj(avg_eeg)  # (batch, T, embed_dim)
-        
-        # Encode with Transformer
-        memory = self.encoder(eeg_embed)  # (batch, T, embed_dim)
-        memory = self.encoder_proj(memory)  # (batch, T, embed_dim)
-        
-        # Average over time to get single representation
-        memory = memory.mean(dim=1, keepdim=True)  # (batch, 1, embed_dim)
-        
-        # Decode to text
-        if tgt_tokens is not None:
-            tgt_input = tgt_tokens[:, :-1]
-            if tgt_mask is None:
-                tgt_len = tgt_input.shape[1]
-                tgt_mask = self.decoder.generate_mask(tgt_len, self.device)
-            
-            logits = self.decoder(
-                tgt=tgt_input,
-                memory=memory,
-                tgt_mask=tgt_mask
-            )
-            
-            return logits, {
-                'memory': memory,
-                'eeg_embed': eeg_embed
-            }
-        else:
-            return memory, {
-                'memory': memory,
-                'eeg_embed': eeg_embed
-            }
-    
+        del unused
+        memory, encoder_attention_mask = self.encode(eeg_bands, window_mask)
+        extras = {'memory': memory, 'encoder_attention_mask': encoder_attention_mask}
+        if tgt_tokens is None:
+            return memory, extras
+
+        logits = self.decoder(
+            tgt=tgt_tokens,
+            memory=memory,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            encoder_attention_mask=encoder_attention_mask,
+            tgt_mask=tgt_mask
+        )
+        return logits, extras
+
     def generate(
         self,
         eeg_bands: Dict[str, torch.Tensor],
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
-        pad_token_id: int = 0,
+        bos_token_id: int = None,
+        eos_token_id: int = None,
+        pad_token_id: int = None,
         max_length: int = 128,
-        beam_size: int = 5
+        beam_size: int = 5,
+        window_mask: Optional[torch.Tensor] = None,
+        **kwargs
     ):
-        """Generate text from EEG"""
+        del bos_token_id, eos_token_id, pad_token_id, kwargs
         self.eval()
-        device = list(eeg_bands.values())[0].device
-        batch_size = list(eeg_bands.values())[0].shape[0]
-        
-        memory, _ = self.forward(eeg_bands)
-        
-        generated = torch.full((batch_size, 1), bos_token_id, dtype=torch.long, device=device)
-        
-        with torch.no_grad():
-            for _ in range(max_length - 1):
-                tgt_mask = self.decoder.generate_mask(generated.shape[1], device)
-                logits = self.decoder(generated, memory, tgt_mask)
-                next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                generated = torch.cat([generated, next_token], dim=1)
-                if (next_token == eos_token_id).all():
-                    break
-        
-        return generated
-
+        memory, encoder_attention_mask = self.encode(eeg_bands, window_mask)
+        return self.decoder.generate(
+            memory=memory,
+            encoder_attention_mask=encoder_attention_mask,
+            max_length=max_length,
+            num_beams=beam_size
+        )

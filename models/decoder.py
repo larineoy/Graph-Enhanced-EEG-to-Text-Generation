@@ -1,10 +1,17 @@
 """
-Transformer Decoder for EEG-to-Text Generation
+Language decoder for EEG-to-Text generation.
+
+The paper uses a pretrained BART-style decoder. BartEEGDecoder is the
+production decoder; TransformerDecoder is retained only as a fallback.
 """
+
+import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
-import math
+from transformers import BartForConditionalGeneration
+from transformers.modeling_outputs import BaseModelOutput
 
 
 class PositionalEncoding(nn.Module):
@@ -159,4 +166,96 @@ class TransformerDecoder(nn.Module):
         mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1)
         mask = mask.masked_fill(mask == 1, float('-inf'))
         return mask
+
+
+class BartEEGDecoder(nn.Module):
+    """
+    Pretrained BART decoder that cross-attends to EEG memory M.
+    """
+
+    def __init__(self, pretrained_name: str = 'facebook/bart-base'):
+        super().__init__()
+        self.bart = BartForConditionalGeneration.from_pretrained(pretrained_name)
+        self.config = self.bart.config
+        self.d_model = self.config.d_model
+        self.vocab_size = self.config.vocab_size
+        self.decoder_start_token_id = self.config.decoder_start_token_id
+        self.bos_token_id = self.config.bos_token_id
+        self.eos_token_id = self.config.eos_token_id
+        self.pad_token_id = self.config.pad_token_id
+
+    def _shift_tokens_right(self, labels: torch.Tensor) -> torch.Tensor:
+        """BART decoder inputs: [eos, label_0, ..., label_{L-2}]."""
+        shifted = labels.new_zeros(labels.shape)
+        shifted[:, 1:] = labels[:, :-1].clone()
+        shifted[:, 0] = self.decoder_start_token_id
+        shifted.masked_fill_(labels == -100, self.pad_token_id)
+        return shifted
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        tgt_mask: Optional[torch.Tensor] = None
+    ):
+        """
+        Args:
+            tgt: Full label ids (batch, tgt_len), the same tokens the
+                tokenizer produced. Logits are aligned with `tgt`.
+            memory: EEG memory M (batch, src_len, d_model)
+            tgt_key_padding_mask: Unused; padding is taken from `tgt`
+            encoder_attention_mask: 1 where EEG windows are valid
+            tgt_mask: Unused; BART applies its own causal mask
+        """
+        del tgt_mask, tgt_key_padding_mask
+        decoder_input_ids = self._shift_tokens_right(tgt)
+        decoder_attention_mask = (decoder_input_ids != self.pad_token_id).long()
+        if encoder_attention_mask is not None:
+            encoder_attention_mask = encoder_attention_mask.long()
+
+        encoder_outputs = BaseModelOutput(last_hidden_state=memory)
+        outputs = self.bart(
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            encoder_outputs=encoder_outputs,
+            attention_mask=encoder_attention_mask,
+            use_cache=False
+        )
+        return outputs.logits
+
+    def generate(
+        self,
+        memory: torch.Tensor,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        max_length: int = 128,
+        num_beams: int = 5,
+        **kwargs
+    ):
+        if encoder_attention_mask is not None:
+            encoder_attention_mask = encoder_attention_mask.long()
+        batch_size = memory.size(0)
+        decoder_input_ids = torch.full(
+            (batch_size, 1),
+            int(self.decoder_start_token_id),
+            dtype=torch.long,
+            device=memory.device
+        )
+        # Do not pass encoder `input_ids`. Those would be re-encoded as text
+        # and would replace the EEG memory with a constant dummy source.
+        return self.bart.generate(
+            encoder_outputs=BaseModelOutput(last_hidden_state=memory),
+            attention_mask=encoder_attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            max_new_tokens=max(8, max_length - 2),
+            num_beams=num_beams,
+            early_stopping=num_beams > 1,
+            decoder_start_token_id=self.decoder_start_token_id,
+            forced_bos_token_id=self.bos_token_id,
+            eos_token_id=self.eos_token_id,
+            pad_token_id=self.pad_token_id,
+            no_repeat_ngram_size=3 if num_beams > 1 else 0,
+            **kwargs
+        )
 
