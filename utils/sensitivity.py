@@ -18,31 +18,16 @@ def generate_hyperparameter_grid(base_config: Dict) -> List[Dict]:
     Returns:
         config_grid: List of configuration dictionaries
     """
-    # Define parameter ranges
-    alpha_values = [0.0, 0.25, 0.5, 0.75, 1.0]
-    beta_values = [0.0, 0.25, 0.5, 0.75, 1.0]
-    
-    # Filter: only valid combinations (alpha + beta can vary, but typically sum to 1)
-    # Or test independently
+    k_spatial_values = [3, 6, 8, 12]
+    k_functional_values = [3, 6, 8, 12]
     configs = []
-    
-    # Test alpha values (with beta = 1 - alpha)
-    for alpha in alpha_values:
-        config = base_config.copy()
-        config['strg_alpha'] = alpha
-        config['strg_beta'] = 1.0 - alpha
-        config['experiment_name'] = f'alpha_{alpha}_beta_{1.0-alpha}'
-        configs.append(config)
-    
-    # Test beta values independently (with alpha fixed at 0.5)
-    for beta in beta_values:
-        if beta != 0.5:  # Already covered above
+    for k_spatial in k_spatial_values:
+        for k_functional in k_functional_values:
             config = base_config.copy()
-            config['strg_alpha'] = 0.5
-            config['strg_beta'] = beta
-            config['experiment_name'] = f'alpha_0.5_beta_{beta}'
+            config['k_spatial'] = k_spatial
+            config['k_functional'] = k_functional
+            config['experiment_name'] = f'ks_{k_spatial}_kf_{k_functional}'
             configs.append(config)
-    
     return configs
 
 

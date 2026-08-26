@@ -12,31 +12,24 @@ import random
 def create_shuffled_channel_baseline(eeg_bands: Dict[str, torch.Tensor], seed: Optional[int] = None) -> Dict[str, torch.Tensor]:
     """
     Create baseline by shuffling EEG channels (destroys spatial relationships)
-    
-    Args:
-        eeg_bands: Original EEG bands dictionary
-        seed: Random seed for reproducibility
-        
-    Returns:
-        shuffled_bands: Bands with shuffled channels
     """
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
-    
+        torch.manual_seed(seed)
+
     shuffled_bands = {}
     for band_name, band_data in eeg_bands.items():
-        batch_size, num_channels, time_steps = band_data.shape
-        
         shuffled_data = band_data.clone()
-        
-        # Shuffle channels for each sample in batch
-        for b in range(batch_size):
+        channel_dim = 1 if shuffled_data.dim() == 3 else 2
+        num_channels = shuffled_data.shape[channel_dim]
+        for b in range(shuffled_data.shape[0]):
             perm = torch.randperm(num_channels)
-            shuffled_data[b] = band_data[b, perm, :]
-        
+            if shuffled_data.dim() == 3:
+                shuffled_data[b] = band_data[b, perm, :]
+            else:
+                shuffled_data[b] = band_data[b, :, perm, :]
         shuffled_bands[band_name] = shuffled_data
-    
     return shuffled_bands
 
 
@@ -57,14 +50,14 @@ def create_shuffled_time_baseline(eeg_bands: Dict[str, torch.Tensor], seed: Opti
     
     shuffled_bands = {}
     for band_name, band_data in eeg_bands.items():
-        batch_size, num_channels, time_steps = band_data.shape
-        
         shuffled_data = band_data.clone()
-        
-        # Shuffle time dimension for each sample in batch
-        for b in range(batch_size):
-            perm = torch.randperm(time_steps)
-            shuffled_data[b] = band_data[b, :, perm]
+        time_dim = shuffled_data.dim() - 1
+        for b in range(shuffled_data.shape[0]):
+            perm = torch.randperm(shuffled_data.shape[time_dim])
+            if shuffled_data.dim() == 3:
+                shuffled_data[b] = band_data[b, :, perm]
+            else:
+                shuffled_data[b] = band_data[b, :, :, perm]
         
         shuffled_bands[band_name] = shuffled_data
     
