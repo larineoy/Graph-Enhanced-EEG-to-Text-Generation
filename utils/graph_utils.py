@@ -210,3 +210,88 @@ def window_eeg_signal(eeg_data: np.ndarray, window_size: int, stride: int):
     
     return np.array(windows)
 
+
+def segment_into_windows(
+    eeg_data: np.ndarray,
+    window_size: int,
+    stride: Optional[int] = None,
+    max_windows: Optional[int] = None
+) -> np.ndarray:
+    """
+    Divide a sentence-aligned EEG recording into fixed-length windows.
+
+    Short recordings are edge-padded to one window. A trailing remainder of at
+    least half a window is kept as a final (possibly overlapping) window.
+
+    Args:
+        eeg_data: EEG of shape (num_channels, time_steps)
+        window_size: Window length in samples
+        stride: Hop size in samples (defaults to window_size, i.e. non-overlapping)
+        max_windows: Optional cap; extra windows are subsampled evenly
+
+    Returns:
+        windows: Array of shape (num_windows, num_channels, window_size)
+    """
+    if stride is None:
+        stride = window_size
+
+    eeg_data = np.ascontiguousarray(eeg_data, dtype=np.float32)
+    num_channels, time_steps = eeg_data.shape
+
+    if time_steps <= 0:
+        raise ValueError("EEG recording is empty")
+
+    if time_steps < window_size:
+        pad_width = window_size - time_steps
+        padded = np.pad(eeg_data, ((0, 0), (0, pad_width)), mode='edge')
+        return padded[None, ...]
+
+    windows = []
+    start = 0
+    last_end = 0
+    while start + window_size <= time_steps:
+        windows.append(eeg_data[:, start:start + window_size])
+        last_end = start + window_size
+        start += stride
+
+    remainder = time_steps - last_end
+    if remainder >= window_size // 2:
+        windows.append(eeg_data[:, time_steps - window_size:time_steps])
+
+    stacked = np.stack(windows, axis=0)
+    if max_windows is not None and stacked.shape[0] > max_windows:
+        idx = np.linspace(0, stacked.shape[0] - 1, max_windows, dtype=int)
+        stacked = stacked[idx]
+    return stacked
+
+
+def expand_channel_graph_to_frequency_blocks(
+    A_channels: torch.Tensor,
+    num_frequency_bands: int
+) -> torch.Tensor:
+    """
+    Replicate a C x C channel graph as a block-diagonal CF x CF matrix.
+
+    Args:
+        A_channels: (..., C, C)
+        num_frequency_bands: F
+
+    Returns:
+        A_blocks: (..., C*F, C*F)
+    """
+    *leading, num_channels, _ = A_channels.shape
+    eye_f = torch.eye(num_frequency_bands, device=A_channels.device, dtype=A_channels.dtype)
+    # (..., F, C, C) if we expand a single channel graph across bands
+    if A_channels.dim() == 2:
+        A_banded = A_channels.unsqueeze(0).expand(num_frequency_bands, -1, -1)
+        leading = []
+    else:
+        A_banded = A_channels
+        if A_banded.shape[-3] != num_frequency_bands:
+            A_banded = A_banded.unsqueeze(-3).expand(*leading, num_frequency_bands, num_channels, num_channels)
+
+    # A_full[..., f*C+i, g*C+j] = A_banded[..., f, i, j] if f == g else 0
+    A_blocks = torch.einsum('...fij,fg->...figj', A_banded, eye_f)
+    num_nodes = num_channels * num_frequency_bands
+    return A_blocks.reshape(*A_blocks.shape[:-4], num_nodes, num_nodes)
+
