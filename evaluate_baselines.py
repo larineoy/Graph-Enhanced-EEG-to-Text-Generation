@@ -21,7 +21,15 @@ from utils.baselines import (
     create_random_gaussian_baseline,
     create_random_uniform_baseline
 )
-from train import load_config, create_model, set_seed
+from train import (
+    load_config,
+    create_model,
+    set_seed,
+    dataset_kwargs_from_config,
+    get_decoder_tokenizer,
+    move_eeg_batch,
+    sync_model_config_from_dataset,
+)
 
 
 def evaluate_baseline(
@@ -53,8 +61,8 @@ def evaluate_baseline(
     with torch.no_grad():
         for batch in tqdm(dataloader, desc=f'Evaluating {baseline_type}'):
             # Create baseline version of EEG bands
-            original_eeg_bands = {k: v.to(device) for k, v in batch['eeg_bands'].items()}
-            
+            original_eeg_bands, window_mask, eeg_bands_full, eeg_windows = move_eeg_batch(batch, device)
+
             if baseline_type == 'shuffled_channels':
                 eeg_bands = create_shuffled_channel_baseline(original_eeg_bands)
             elif baseline_type == 'shuffled_time':
@@ -65,21 +73,21 @@ def evaluate_baseline(
                 eeg_bands = create_random_uniform_baseline(original_eeg_bands, low=-1.0, high=1.0)
             else:
                 eeg_bands = original_eeg_bands
-            
+
             texts = batch['text']
-            
             generated = model.generate(
                 eeg_bands,
-                bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else 1,
-                eos_token_id=tokenizer.eos_token_id if hasattr(tokenizer, 'eos_token_id') else 2,
-                pad_token_id=tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else 0,
-                max_length=config['model']['decoder']['max_decoder_length']
+                max_length=config['model']['decoder']['max_decoder_length'],
+                beam_size=config.get('evaluation', {}).get('beam_size', 5),
+                window_mask=window_mask,
+                eeg_bands_full=eeg_bands_full,
+                eeg_windows=eeg_windows
             )
             
             for i, text in enumerate(texts):
                 ref = text.split()
                 if hasattr(tokenizer, 'decode'):
-                    cand = tokenizer.decode(generated[i].cpu().tolist()).split()
+                    cand = tokenizer.decode(generated[i].cpu().tolist(), skip_special_tokens=True).split()
                 else:
                     cand = [str(t.item()) for t in generated[i]]
                 all_references.append(ref)
@@ -102,34 +110,32 @@ def main():
     config = load_config(args.config)
     set_seed(config['seed'])
     device = torch.device(config['device'] if torch.cuda.is_available() else 'cpu')
-    
-    # Load model
+
+    tokenizer = get_decoder_tokenizer(config)
+    dataset = ZuCoDataset(
+        args.data_dir,
+        split=args.split,
+        **dataset_kwargs_from_config(config)
+    )
+    sync_model_config_from_dataset(config, dataset)
+
     model = create_model(config, device)
+    if getattr(dataset, 'electrode_positions', None) is not None:
+        model.set_electrode_positions(dataset.electrode_positions)
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
     model.eval()
-    
-    # Create dataset
-    dataset = ZuCoDataset(
-        args.data_dir,
-        split=args.split,
-        max_seq_length=config['data']['max_seq_length']
-    )
-    
-    try:
-        tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-    except:
-        tokenizer = None
-    
+
+    max_eeg_length = config['model'].get('max_eeg_length', 20000)
     dataloader = DataLoader(
         dataset,
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        collate_fn=lambda x: collate_fn(x, tokenizer, config['data']['max_seq_length']),
-        num_workers=config['num_workers']
+        collate_fn=lambda x: collate_fn(
+            x, tokenizer, config['data']['max_seq_length'], max_eeg_length=max_eeg_length
+        ),
+        num_workers=config.get('num_workers', 0)
     )
     
     # Evaluate on different baselines
@@ -158,7 +164,7 @@ def main():
     print('=' * 60)
     for baseline_name, metrics in all_results.items():
         bleu4 = metrics.get('bleu_4', 0)
-        rouge1f = metrics.get('rouge1_fmeasure', 0)
+        rouge1f = metrics.get('rouge1_F', metrics.get('rouge1_fmeasure', 0))
         print(f"{baseline_name:<25} {bleu4:<15.2f} {rouge1f:<15.2f}")
     print('=' * 60)
     

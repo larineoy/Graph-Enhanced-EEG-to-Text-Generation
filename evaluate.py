@@ -19,7 +19,15 @@ import sys
 import os
 # Add scripts directory to path to import from train
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from train import load_config, create_model, set_seed
+from train import (
+    load_config,
+    create_model,
+    set_seed,
+    dataset_kwargs_from_config,
+    get_decoder_tokenizer,
+    move_eeg_batch,
+    sync_model_config_from_dataset,
+)
 
 
 def evaluate(model, dataloader, device, tokenizer, config):
@@ -31,24 +39,23 @@ def evaluate(model, dataloader, device, tokenizer, config):
     with torch.no_grad():
         for batch in tqdm(dataloader, desc='Evaluating'):
             # Use eeg_bands dict from preprocessing
-            eeg_bands = {band_name: band_tensor.to(device) for band_name, band_tensor in batch['eeg_bands'].items()}
+            eeg_bands, window_mask, eeg_bands_full, eeg_windows = move_eeg_batch(batch, device)
             texts = batch['text']
-            
-            # Generate predictions
+
             generated = model.generate(
                 eeg_bands,
-                bos_token_id=tokenizer.bos_token_id if hasattr(tokenizer, 'bos_token_id') else 1,
-                eos_token_id=tokenizer.eos_token_id if hasattr(tokenizer, 'eos_token_id') else 2,
-                pad_token_id=tokenizer.pad_token_id if hasattr(tokenizer, 'pad_token_id') else 0,
                 max_length=config['model']['decoder']['max_decoder_length'],
-                beam_size=config['evaluation']['beam_size']
+                beam_size=config['evaluation']['beam_size'],
+                window_mask=window_mask,
+                eeg_bands_full=eeg_bands_full,
+                eeg_windows=eeg_windows
             )
             
             # Decode predictions
             for i in range(len(texts)):
                 ref = texts[i].split()
                 if hasattr(tokenizer, 'decode'):
-                    cand = tokenizer.decode(generated[i].cpu().tolist()).split()
+                    cand = tokenizer.decode(generated[i].cpu().tolist(), skip_special_tokens=True).split()
                 else:
                     cand = [str(t.item()) for t in generated[i]]
                 
@@ -97,40 +104,28 @@ def main():
     print(f"  ✓ Using device: {device}")
     
     print("\n[STAGE 3/6] Initializing tokenizer...")
-    # Create tokenizer
-    try:
-        tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        print("  ✓ BERT tokenizer loaded successfully")
-    except:
-        print("  ⚠ Warning: Could not load tokenizer, using simple tokenizer")
-        tokenizer = None
+    tokenizer = get_decoder_tokenizer(config)
+    print("  ✓ BART tokenizer loaded successfully")
     
     print(f"\n[STAGE 4/6] Loading {args.split} dataset...")
     print("  This may take a few minutes...")
-    # Create dataset with artifact removal settings from config
-    data_config = config['data']
     dataset = ZuCoDataset(
         args.data_dir,
         split=args.split,
-        max_seq_length=data_config['max_seq_length'],
-        apply_notch_filter=data_config.get('apply_notch_filter', True),
-        notch_freq=data_config.get('notch_freq', 50.0),
-        apply_highpass_filter=data_config.get('apply_highpass_filter', True),
-        highpass_cutoff=data_config.get('highpass_cutoff', 0.5),
-        detect_bad_channels=data_config.get('detect_bad_channels', False),
-        bad_channel_threshold=data_config.get('bad_channel_threshold', 3.0)
+        **dataset_kwargs_from_config(config)
     )
+    sync_model_config_from_dataset(config, dataset)
+    print(f"  ✓ Loaded {len(dataset)} samples ({config['model']['num_channels']} channels)")
     
-    print(f"  ✓ Loaded {len(dataset)} samples")
-    
+    max_eeg_length = config['model'].get('max_eeg_length', 20000)
     dataloader = DataLoader(
         dataset,
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        collate_fn=lambda x: collate_fn(x, tokenizer, config['data']['max_seq_length']),
-        num_workers=config['num_workers']
+        collate_fn=lambda x: collate_fn(
+            x, tokenizer, config['data']['max_seq_length'], max_eeg_length=max_eeg_length
+        ),
+        num_workers=config.get('num_workers', 0)
     )
     print(f"  ✓ Created data loader with {len(dataloader)} batches")
     
@@ -157,6 +152,8 @@ def main():
             
             # Step 2: Load model for this seed (Line ~XXX)
             model = create_model(config, device)
+            if getattr(dataset, 'electrode_positions', None) is not None:
+                model.set_electrode_positions(dataset.electrode_positions)
             checkpoint = torch.load(checkpoint_path, map_location=device)
             model.load_state_dict(checkpoint['model_state_dict'])
             model = model.to(device)
@@ -206,6 +203,8 @@ def main():
         # Load model
         print(f"  ✓ Loading checkpoint: {args.checkpoint}")
         model = create_model(config, device)
+        if getattr(dataset, 'electrode_positions', None) is not None:
+            model.set_electrode_positions(dataset.electrode_positions)
         checkpoint = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         model = model.to(device)

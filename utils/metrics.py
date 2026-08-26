@@ -4,7 +4,7 @@ Evaluation metrics for EEG-to-Text generation
 
 from typing import List, Dict
 import numpy as np
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from nltk.translate.bleu_score import corpus_bleu, sentence_bleu, SmoothingFunction
 from rouge_score import rouge_scorer
 try:
     from bert_score import score as bert_score_func
@@ -12,40 +12,44 @@ except ImportError:
     bert_score_func = None
 
 
-def compute_bleu(reference: List[str], candidate: List[str], n: int = 4):
-    """
-    Compute BLEU-n score
-    
-    Args:
-        reference: List of reference words
-        candidate: List of candidate words
-        n: n-gram order (1-4)
-        
-    Returns:
-        bleu_score: BLEU-n score
-    """
-    smoothing = SmoothingFunction().method1
-    
+def _bleu_weights(n: int):
     if n == 1:
-        weights = (1.0,)
-    elif n == 2:
-        weights = (0.5, 0.5)
-    elif n == 3:
-        weights = (1/3, 1/3, 1/3)
-    else:
-        weights = (0.25, 0.25, 0.25, 0.25)
-    
+        return (1.0, 0.0, 0.0, 0.0)
+    if n == 2:
+        return (0.5, 0.5, 0.0, 0.0)
+    if n == 3:
+        return (1 / 3, 1 / 3, 1 / 3, 0.0)
+    return (0.25, 0.25, 0.25, 0.25)
+
+
+def compute_bleu(reference: List[str], candidate: List[str], n: int = 4):
+    """Sentence-level BLEU-n (diagnostic only)."""
+    smoothing = SmoothingFunction().method1
     try:
-        score = sentence_bleu(
+        return sentence_bleu(
             [reference],
             candidate,
-            weights=weights[:n],
+            weights=_bleu_weights(n)[:n],
             smoothing_function=smoothing
         )
-    except:
-        score = 0.0
-    
-    return score
+    except Exception:
+        return 0.0
+
+
+def compute_corpus_bleu(references: List[List[str]], candidates: List[List[str]], n: int = 4) -> float:
+    """Corpus BLEU-n, the score reported in experiment tables."""
+    if len(references) == 0:
+        return 0.0
+    smoothing = SmoothingFunction().method1
+    try:
+        return float(corpus_bleu(
+            [[ref] for ref in references],
+            candidates,
+            weights=_bleu_weights(n),
+            smoothing_function=smoothing
+        ))
+    except Exception:
+        return 0.0
 
 
 def compute_rouge(reference: str, candidate: str, rouge_type: str = 'rouge1'):
@@ -63,6 +67,28 @@ def compute_rouge(reference: str, candidate: str, rouge_type: str = 'rouge1'):
     scorer = rouge_scorer.RougeScorer([rouge_type], use_stemmer=True)
     scores = scorer.score(reference, candidate)
     return scores[rouge_type]
+
+
+def compute_wer(reference: List[str], candidate: List[str]) -> float:
+    """
+    Word error rate: (substitutions + deletions + insertions) / reference length.
+    """
+    if len(reference) == 0:
+        return 0.0 if len(candidate) == 0 else 1.0
+
+    n, m = len(reference), len(candidate)
+    dp = np.zeros((n + 1, m + 1), dtype=np.int32)
+    dp[:, 0] = np.arange(n + 1)
+    dp[0, :] = np.arange(m + 1)
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = 0 if reference[i - 1] == candidate[j - 1] else 1
+            dp[i, j] = min(
+                dp[i - 1, j] + 1,
+                dp[i, j - 1] + 1,
+                dp[i - 1, j - 1] + cost
+            )
+    return float(dp[n, m]) / float(n)
 
 
 def compute_bertscore(references: List[str], candidates: List[str]):
@@ -117,33 +143,27 @@ def evaluate_predictions(
     ref_strings = [' '.join(ref) for ref in references]
     cand_strings = [' '.join(cand) for cand in candidates]
     
-    # BLEU scores
-    bleu_scores = {f'bleu_{i}': [] for i in range(1, 5)}
+    wer_scores = []
     rouge_scores = {
         'rouge1': {'precision': [], 'recall': [], 'fmeasure': []},
         'rouge2': {'precision': [], 'recall': [], 'fmeasure': []},
         'rougeL': {'precision': [], 'recall': [], 'fmeasure': []}
     }
-    
+
     for ref, cand in zip(references, candidates):
-        # BLEU
-        for n in range(1, 5):
-            bleu_scores[f'bleu_{n}'].append(compute_bleu(ref, cand, n))
-        
-        # ROUGE
+        wer_scores.append(compute_wer(ref, cand))
         ref_str = ' '.join(ref)
         cand_str = ' '.join(cand)
-        
         for rouge_type in ['rouge1', 'rouge2', 'rougeL']:
             rouge = compute_rouge(ref_str, cand_str, rouge_type)
             rouge_scores[rouge_type]['precision'].append(rouge.precision)
             rouge_scores[rouge_type]['recall'].append(rouge.recall)
             rouge_scores[rouge_type]['fmeasure'].append(rouge.fmeasure)
-    
-    # Average BLEU scores
-    for key, scores in bleu_scores.items():
-        metrics[key] = np.mean(scores) * 100  # Convert to percentage
-    
+
+    for n in range(1, 5):
+        metrics[f'bleu_{n}'] = compute_corpus_bleu(references, candidates, n) * 100
+    metrics['wer'] = float(np.mean(wer_scores) * 100) if wer_scores else 0.0
+
     # Average ROUGE scores
     for rouge_type, scores_dict in rouge_scores.items():
         for metric_name, scores in scores_dict.items():

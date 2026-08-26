@@ -10,17 +10,15 @@ import torch.nn.functional as F
 
 class CompositeLoss(nn.Module):
     """
-    Composite loss function combining:
-    1. Cross-entropy loss for token prediction
-    2. Graph smoothness regularization
-    3. Contrastive alignment loss
+    Training objective. The paper uses teacher-forced generation loss only;
+    smoothness and contrastive terms remain available but default to 0.
     """
     
     def __init__(
         self,
-        lambda_smooth: float = 0.1,
-        lambda_contrastive: float = 0.2,
-        lambda_diversity: float = 1.0,  # NEW: Diversity regularization to prevent STRE collapse
+        lambda_smooth: float = 0.0,
+        lambda_contrastive: float = 0.0,
+        lambda_diversity: float = 0.0,
         vocab_size: int = 10000,
         ignore_index: int = -100
     ):

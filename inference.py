@@ -11,7 +11,7 @@ from transformers import AutoTokenizer
 from typing import Dict
 
 from models import GraphEnhancedEEG2Text
-from train import load_config, create_model, set_seed
+from train import load_config, create_model, set_seed, get_decoder_tokenizer
 
 
 def load_eeg_from_file(filepath: str):
@@ -158,16 +158,6 @@ def main():
     device = torch.device(config['device'] if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     
-    # Load model
-    model = create_model(config, device)
-    checkpoint = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(device)
-    model.eval()
-    
-    print(f'Loaded model from {args.checkpoint}')
-    
-    # Load EEG data
     print(f'Loading EEG data from {args.eeg_file}')
     eeg = load_eeg_from_file(args.eeg_file)
     
@@ -177,6 +167,14 @@ def main():
             eeg = eeg.T  # Transpose if needed
     else:
         raise ValueError(f"Expected 2D EEG array, got shape {eeg.shape}")
+
+    config['model']['num_channels'] = eeg.shape[0]
+    model = create_model(config, device)
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model = model.to(device)
+    model.eval()
+    print(f'Loaded model from {args.checkpoint} ({eeg.shape[0]} channels)')
     
     # Preprocess with artifact removal
     eeg = preprocess_eeg(
@@ -212,14 +210,7 @@ def main():
     
     print(f'EEG bands shape: {[f"{k}: {v.shape}" for k, v in eeg_bands.items()]}')
     
-    # Create tokenizer
-    try:
-        tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-    except:
-        print("Warning: Could not load tokenizer")
-        tokenizer = None
+    tokenizer = get_decoder_tokenizer(config)
     
     # Generate text
     print('Generating text...')
