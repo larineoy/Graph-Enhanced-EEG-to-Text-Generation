@@ -17,6 +17,8 @@ import glob
 import h5py
 from tqdm import tqdm
 import time
+import gc
+import json
 
 
 class ZuCoDataset(Dataset):
@@ -50,7 +52,11 @@ class ZuCoDataset(Dataset):
         apply_highpass_filter: bool = True,
         highpass_cutoff: float = 0.5,  # Remove slow drifts below 0.5 Hz
         detect_bad_channels: bool = False,  # Optional: detect and interpolate bad channels
-        bad_channel_threshold: float = 3.0  # Standard deviations for bad channel detection
+        bad_channel_threshold: float = 3.0,  # Standard deviations for bad channel detection
+        split_seed: int = 42,
+        window_size_sec: float = 1.0,
+        window_stride_sec: Optional[float] = None,
+        max_windows: int = 16
     ):
         """
         Args:
@@ -78,6 +84,12 @@ class ZuCoDataset(Dataset):
         self.highpass_cutoff = highpass_cutoff
         self.detect_bad_channels = detect_bad_channels
         self.bad_channel_threshold = bad_channel_threshold
+        self.split_seed = split_seed
+        self.window_size_sec = window_size_sec
+        self.window_stride_sec = window_stride_sec if window_stride_sec is not None else window_size_sec
+        self.max_windows = max_windows
+        self.window_size = max(1, int(round(self.window_size_sec * self.sampling_rate))) if window_size_sec else 0
+        self.window_stride = max(1, int(round(self.window_stride_sec * self.sampling_rate))) if self.window_size else 0
         
         # Detect ZuCo versions available
         # Support loading from both ZuCo 1.0 and ZuCo 2.0
@@ -104,56 +116,27 @@ class ZuCoDataset(Dataset):
                 raise ValueError(f"ZuCo {version} not found in {data_dir}")
             self.versions_to_load = [version]
             self.version = version
+
+        keep = 0
+        if self.window_size and self.max_windows:
+            keep = self.window_size + (self.max_windows - 1) * self.window_stride
+        self._cache_dir = os.path.join(
+            self.data_dir, '.cache', f'zuco_win{self.max_windows}_keep{keep}'
+        )
+        self._cache_index_path = os.path.join(self._cache_dir, 'index.json')
+        self._next_cache_id = 0
         
         # Load all aligned samples with progress tracking
         print(f"  Loading EEG files and aligning with text (this may take 2-10 minutes)...")
         start_time = time.time()
         self.samples = self._load_aligned_samples()
         load_time = time.time() - start_time
-        
-        # Extract actual number of channels and electrode positions from ZuCo data (not hardcoded)
-        if len(self.samples) > 0:
-            # Check channel counts across all samples (important when loading multiple versions)
-            channel_counts = {}
-            for sample in self.samples:
-                if 'eeg_raw' in sample:
-                    eeg_shape = sample['eeg_raw'].shape
-                    if len(eeg_shape) == 2:  # (channels, time)
-                        num_ch = eeg_shape[0]
-                        channel_counts[num_ch] = channel_counts.get(num_ch, 0) + 1
-                    else:
-                        raise ValueError(f"Unexpected EEG shape: {eeg_shape}. Expected (channels, time)")
-                else:
-                    raise ValueError("No 'eeg_raw' found in samples")
-            
-            # Use most common channel count
-            if channel_counts:
-                detected_channels = max(channel_counts, key=channel_counts.get)
-                self.num_channels = detected_channels
-                print(f"  ✓ Detected {detected_channels} channels from ZuCo data")
-                
-                # Warn if there are multiple channel counts (might indicate version mismatch)
-                if len(channel_counts) > 1:
-                    print(f"  ⚠️  WARNING: Multiple channel counts detected: {channel_counts}")
-                    print(f"  ⚠️  Using most common: {detected_channels} channels ({channel_counts[detected_channels]} samples)")
-                    print(f"  ⚠️  Samples with different channel counts will need to be handled separately")
-            else:
-                raise ValueError("Could not determine channel count from samples")
-            
-            # Extract electrode positions from first sample if available (from ZuCo chanlocs)
-            first_sample = self.samples[0]  # Define first_sample here
-            if 'channel_info' in first_sample and 'electrode_positions' in first_sample['channel_info']:
-                self.electrode_positions = first_sample['channel_info']['electrode_positions']
-                print(f"  ✓ Extracted {len(self.electrode_positions)} electrode positions from ZuCo chanlocs (X, Y, Z)")
-            elif 'channel_info' in first_sample and 'channel_names' in first_sample['channel_info']:
-                self.channel_names = first_sample['channel_info']['channel_names']
-                print(f"  ✓ Extracted {len(self.channel_names)} channel names from ZuCo")
-        else:
-            raise ValueError("No samples loaded from ZuCo dataset")
-        
+        self._canonicalize_loaded_samples()
+        self._all_samples = self.samples
+
         # Split data if not 'all'
         if split != 'all':
-            self.samples = self._split_data(self.samples)
+            self.samples = self._split_data(self._all_samples)
         
         # Format version string for display
         if len(self.versions_to_load) > 1:
@@ -169,6 +152,11 @@ class ZuCoDataset(Dataset):
         Returns list of dictionaries with aligned samples
         Supports loading from both ZuCo 1.0 and ZuCo 2.0
         """
+        cached = self._load_sample_cache()
+        if cached is not None:
+            return cached
+
+        os.makedirs(self._cache_dir, exist_ok=True)
         all_samples = []
         
         # Load samples from all specified versions
@@ -185,7 +173,205 @@ class ZuCoDataset(Dataset):
                 print(f"    ✓ Loaded {len(samples_v2)} samples from ZuCo 2.0")
         
         print(f"    ✓ Total samples loaded: {len(all_samples)} (from {len(self.versions_to_load)} version(s))")
+        self._write_sample_cache(all_samples)
         return all_samples
+
+    def _cache_params(self) -> Dict:
+        keep = 0
+        if self.window_size and self.max_windows:
+            keep = self.window_size + (self.max_windows - 1) * self.window_stride
+        return {
+            'versions': list(self.versions_to_load),
+            'max_windows': self.max_windows,
+            'window_size': self.window_size,
+            'keep': keep,
+        }
+
+    def _load_sample_cache(self) -> Optional[List[Dict]]:
+        if not os.path.exists(self._cache_index_path):
+            return None
+        try:
+            with open(self._cache_index_path, 'r') as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if payload.get('params') != self._cache_params():
+            return None
+        samples = payload.get('samples') or []
+        if not samples:
+            return None
+        missing = [s['eeg_path'] for s in samples if not os.path.exists(s.get('eeg_path', ''))]
+        if missing:
+            print(f"  ⚠ EEG cache incomplete ({len(missing)} missing files); rebuilding")
+            return None
+        print(f"  ✓ Loaded {len(samples)} clipped EEG sentences from {self._cache_dir}")
+        return samples
+
+    def _write_sample_cache(self, samples: List[Dict]):
+        os.makedirs(self._cache_dir, exist_ok=True)
+        slim = []
+        for sample in samples:
+            rec = {
+                'eeg_path': sample.get('eeg_path'),
+                'sentence_text': sample.get('sentence_text'),
+                'subject': sample.get('subject'),
+                'task': sample.get('task'),
+                'num_channels': sample.get('num_channels'),
+                'time_steps': sample.get('time_steps'),
+            }
+            info = sample.get('channel_info')
+            if info and 'electrode_positions' in info:
+                rec['channel_info'] = {
+                    'electrode_positions': np.asarray(info['electrode_positions']).tolist()
+                }
+            slim.append(rec)
+        with open(self._cache_index_path, 'w') as f:
+            json.dump({'params': self._cache_params(), 'samples': slim}, f)
+        print(f"  ✓ Wrote EEG cache to {self._cache_dir}")
+
+    def _max_keep_samples(self) -> Optional[int]:
+        if self.window_size and self.max_windows:
+            return self.window_size + (self.max_windows - 1) * self.window_stride
+        return None
+
+    def _materialize_sentence_eeg(self, eeg: np.ndarray) -> Optional[np.ndarray]:
+        """Copy a sentence slice so the parent recording can be freed."""
+        eeg = self._ensure_channels_first(eeg)
+        if eeg is None or eeg.ndim != 2:
+            return None
+        keep = self._max_keep_samples()
+        if keep and eeg.shape[1] > keep:
+            eeg = eeg[:, :keep]
+        return np.ascontiguousarray(eeg, dtype=np.float32)
+
+    def _commit_sample(
+        self,
+        eeg: np.ndarray,
+        sentence_text: str,
+        subject: str,
+        task: str,
+        channel_info: Optional[Dict] = None
+    ) -> Optional[Dict]:
+        eeg = self._materialize_sentence_eeg(eeg)
+        if eeg is None:
+            return None
+        os.makedirs(self._cache_dir, exist_ok=True)
+        path = os.path.join(self._cache_dir, f'{self._next_cache_id:06d}.npy')
+        np.save(path, eeg)
+        self._next_cache_id += 1
+        sample = {
+            'eeg_path': path,
+            'sentence_text': sentence_text,
+            'subject': subject,
+            'task': task,
+            'num_channels': int(eeg.shape[0]),
+            'time_steps': int(eeg.shape[1]),
+        }
+        if channel_info:
+            sample['channel_info'] = channel_info
+        return sample
+
+    def _load_sample_eeg(self, sample: Dict) -> np.ndarray:
+        if sample.get('eeg_raw') is not None:
+            return np.array(sample['eeg_raw'], copy=True)
+        return np.load(sample['eeg_path'])
+
+    @staticmethod
+    def _ensure_channels_first(eeg: Optional[np.ndarray], max_channels: int = 256) -> Optional[np.ndarray]:
+        """Force (channels, time). Never treat a long time axis as channels."""
+        if eeg is None or not isinstance(eeg, np.ndarray):
+            return eeg
+        if eeg.ndim != 2:
+            return eeg
+        dim0, dim1 = eeg.shape
+        dim0_looks_like_channels = 8 <= dim0 <= max_channels
+        dim1_looks_like_channels = 8 <= dim1 <= max_channels
+        if dim0_looks_like_channels and not dim1_looks_like_channels:
+            return eeg
+        if dim1_looks_like_channels and not dim0_looks_like_channels:
+            return eeg.T
+        if dim0_looks_like_channels and dim1_looks_like_channels:
+            return eeg if dim0 <= dim1 else eeg.T
+        return eeg
+
+    def _canonicalize_loaded_samples(self):
+        """Orient every array as (C, T) and keep one consistent channel count."""
+        if len(self.samples) == 0:
+            raise ValueError("No samples loaded from ZuCo dataset")
+
+        kept = []
+        for sample in self.samples:
+            n_ch = sample.get('num_channels')
+            if n_ch is None:
+                if sample.get('eeg_raw') is not None:
+                    eeg = self._ensure_channels_first(sample['eeg_raw'])
+                    if eeg is None or eeg.ndim != 2:
+                        continue
+                    sample['eeg_raw'] = np.ascontiguousarray(eeg, dtype=np.float32)
+                    sample['num_channels'] = int(eeg.shape[0])
+                    n_ch = sample['num_channels']
+                elif sample.get('eeg_path'):
+                    n_ch = int(np.load(sample['eeg_path'], mmap_mode='r').shape[0])
+                    sample['num_channels'] = n_ch
+                else:
+                    continue
+            kept.append(sample)
+        self.samples = kept
+
+        plausible = {}
+        for sample in self.samples:
+            n_ch = sample['num_channels']
+            if 8 <= n_ch <= 256:
+                plausible[n_ch] = plausible.get(n_ch, 0) + 1
+        if not plausible:
+            raise ValueError(
+                "Could not find any EEG arrays with a plausible channel count "
+                "(expected 8–256 channels after orientation)."
+            )
+
+        self.num_channels = max(plausible, key=plausible.get)
+        before = len(self.samples)
+        self.samples = [
+            sample for sample in self.samples
+            if sample.get('num_channels') == self.num_channels
+        ]
+        dropped = before - len(self.samples)
+        print(f"  ✓ Detected {self.num_channels} channels from ZuCo data "
+              f"({len(self.samples)} usable samples)")
+        if dropped:
+            print(f"  ⚠ Dropped {dropped} samples that were not {self.num_channels}-channel")
+
+        self.electrode_positions = None
+        self.channel_names = None
+        for sample in self.samples:
+            channel_info = sample.get('channel_info') or {}
+            positions = channel_info.get('electrode_positions')
+            if positions is not None and len(positions) == self.num_channels:
+                self.electrode_positions = np.asarray(positions, dtype=np.float32)
+                print(f"  ✓ Extracted {len(self.electrode_positions)} electrode positions from ZuCo chanlocs (X, Y, Z)")
+                break
+            names = channel_info.get('channel_names')
+            if names is not None and len(names) == self.num_channels:
+                self.channel_names = names
+        if self.electrode_positions is None and self.channel_names:
+            print(f"  ✓ Extracted {len(self.channel_names)} channel names from ZuCo")
+
+    def make_split(self, split: str) -> 'ZuCoDataset':
+        """Reuse already-loaded EEG arrays for another sentence-identity split."""
+        other = object.__new__(ZuCoDataset)
+        other.__dict__.update(self.__dict__)
+        other.split = split
+        other.samples = (
+            list(other._all_samples) if split == 'all'
+            else other._split_data(other._all_samples)
+        )
+        return other
+
+    @classmethod
+    def load_splits(cls, data_dir: str, splits=('train', 'val'), **kwargs) -> Dict[str, 'ZuCoDataset']:
+        """Load ZuCo once, then view train/val/test without rereading MATLAB files."""
+        base = cls(data_dir, split='all', **kwargs)
+        return {split: base.make_split(split) for split in splits}
     
     def _load_zuco_v1_samples(self, base_path: str) -> List[Dict]:
         """Load samples from ZuCo 1.0 structure"""
@@ -273,6 +459,7 @@ class ZuCoDataset(Dataset):
                             task_key, subject_dir, 'NR'
                         )
                         samples.extend(eeg_samples)
+                        gc.collect()
             
             elif task_type == 'SR':
                 match = re.search(r'SR(\d+)', eeg_file)
@@ -286,6 +473,7 @@ class ZuCoDataset(Dataset):
                             task_key, subject_dir, 'SR'
                         )
                         samples.extend(eeg_samples)
+                        gc.collect()
         
         print(f"    ✓ Processed {len(all_tasks)} files, extracted {len(samples)} aligned samples")
         return samples
@@ -347,6 +535,8 @@ class ZuCoDataset(Dataset):
                         task_num, subject_dir, 'NR'
                     )
                     samples.extend(eeg_samples)
+                    del eeg_samples
+                    gc.collect()
         
         print(f"    ✓ Processed {len(all_tasks)} files, extracted {len(samples)} aligned samples")
         return samples
@@ -662,23 +852,15 @@ class ZuCoDataset(Dataset):
                     if eeg.dtype == np.float64:
                         eeg = eeg.astype(np.float32)
                     
-                    # Ensure shape is (channels, time)
-                    # ZuCo typically has ~105 channels, so if second dim is ~105 and first is much larger, likely (T, C)
                     if eeg.ndim == 2:
-                        # If first dim > second dim and second dim is in typical channel range (~105), transpose
-                        if eeg.shape[0] > eeg.shape[1] and 50 < eeg.shape[1] < 200:
-                            eeg = eeg.T  # Transpose (T, C) -> (C, T)
-                        # Original check: if channels < time (but channels is reasonable), transpose
-                        elif eeg.shape[0] < eeg.shape[1] and eeg.shape[0] < 200:
-                            eeg = eeg.T
-                        return eeg
+                        return self._ensure_channels_first(eeg)
                     elif eeg.ndim == 3:
                         # (trials, channels, time) -> average or take first trial
                         eeg = eeg[0] if eeg.shape[0] == 1 else np.mean(eeg, axis=0)
                         # Convert to float32 if needed
                         if eeg.dtype == np.float64:
                             eeg = eeg.astype(np.float32)
-                        return eeg
+                        return self._ensure_channels_first(eeg)
         
         # Try to find largest numeric array
         max_size = 0
@@ -699,21 +881,14 @@ class ZuCoDataset(Dataset):
             if best_eeg.dtype == np.float64:
                 best_eeg = best_eeg.astype(np.float32)
             
-            # Ensure shape is (channels, time)
             if best_eeg.ndim == 2:
-                # If first dim > second dim and second dim is in typical channel range (~105), transpose
-                if best_eeg.shape[0] > best_eeg.shape[1] and 50 < best_eeg.shape[1] < 200:
-                    best_eeg = best_eeg.T  # Transpose (T, C) -> (C, T)
-                # Original check: if channels < time (but channels is reasonable), transpose
-                elif best_eeg.shape[0] < best_eeg.shape[1] and best_eeg.shape[0] < 200:
-                    best_eeg = best_eeg.T
-                return best_eeg
+                return self._ensure_channels_first(best_eeg)
             elif best_eeg.ndim == 3:
                 best_eeg = best_eeg[0] if best_eeg.shape[0] == 1 else np.mean(best_eeg, axis=0)
                 # Convert to float32 if needed
                 if best_eeg.dtype == np.float64:
                     best_eeg = best_eeg.astype(np.float32)
-                return best_eeg
+                return self._ensure_channels_first(best_eeg)
         
         return None
     
@@ -740,6 +915,9 @@ class ZuCoDataset(Dataset):
             # Convert to float32 to save memory if still float64
             if eeg.dtype == np.float64:
                 eeg = eeg.astype(np.float32)
+            eeg = self._ensure_channels_first(eeg)
+            if eeg is None or eeg.ndim != 2:
+                return []
             
             # Store raw EEG only - frequency bands will be extracted after preprocessing in __getitem__
             # For ZuCo 1.0, typically one sentence per EEG file
@@ -751,17 +929,12 @@ class ZuCoDataset(Dataset):
             # ZuCo 1.0: one sentence typically corresponds to one EEG file
             # If wordbounds are available, we would segment here, but ZuCo 1.0 structure
             # typically has one sentence per file, so use entire recording
-            sample = {
-                'eeg_raw': eeg,
-                'sentence_text': text,
-                'subject': subject_id,
-                'task': task_key
-            }
-            # Include channel_info if available (electrode positions from ZuCo chanlocs)
-            if 'channel_info' in eeg_data:
-                sample['channel_info'] = eeg_data['channel_info']
-            samples.append(sample)
-            
+            channel_info = eeg_data.get('channel_info')
+            del eeg_data
+            sample = self._commit_sample(eeg, text, subject_id, task_key, channel_info)
+            del eeg
+            if sample is not None:
+                samples.append(sample)
             return samples
             
         except Exception as e:
@@ -792,57 +965,43 @@ class ZuCoDataset(Dataset):
             if eeg.dtype == np.float64:
                 eeg = eeg.astype(np.float32)
             
-            # Ensure shape is (channels, time)
-            if eeg.ndim == 2:
-                if eeg.shape[0] < eeg.shape[1]:
-                    eeg = eeg.T
-            
+            eeg = self._ensure_channels_first(eeg)
+            if eeg is None or eeg.ndim != 2:
+                return []
+
             num_channels, time_steps = eeg.shape
             
             # Try to extract sentence boundaries from wordbounds
             sentence_windows = self._extract_sentence_windows(wordbounds, task_num, time_steps)
             
             samples = []
-            
-            # Align sentences with EEG windows
-            if sentence_windows and len(sentence_windows) > 0:
-                # Use wordbounds for alignment
+            del eeg_data
+
+            def _add_window(start_idx, end_idx, sentence, sent_i):
+                if end_idx <= start_idx or end_idx > time_steps:
+                    return
+                sample = self._commit_sample(
+                    eeg[:, start_idx:end_idx],
+                    sentence,
+                    subject_id,
+                    f'{task_type}{task_num}_sent{sent_i}'
+                )
+                if sample is not None:
+                    samples.append(sample)
+
+            if sentence_windows:
                 num_sentences = min(len(sentences), len(sentence_windows))
-                
                 for i in range(num_sentences):
                     start_idx, end_idx = sentence_windows[i]
-                    
-                    if end_idx > start_idx and end_idx <= time_steps:
-                        # Extract EEG window for this sentence
-                        eeg_window = eeg[:, start_idx:end_idx]
-                        
-                        # Store raw EEG only - frequency bands will be extracted after preprocessing in __getitem__
-                        sample = {
-                            'eeg_raw': eeg_window,
-                            'sentence_text': sentences[i],
-                            'subject': subject_id,
-                            'task': f'{task_type}{task_num}_sent{i+1}'
-                        }
-                        samples.append(sample)
-            else:
-                # Fallback: segment evenly if no wordbounds
-                window_size = time_steps // len(sentences) if sentences else time_steps
+                    _add_window(start_idx, end_idx, sentences[i], i + 1)
+            elif sentences:
+                window_size = time_steps // len(sentences)
                 for i, sentence in enumerate(sentences):
                     start_idx = i * window_size
                     end_idx = (i + 1) * window_size if i < len(sentences) - 1 else time_steps
-                    
-                    if end_idx > start_idx and end_idx <= time_steps:
-                        eeg_window = eeg[:, start_idx:end_idx]
-                        
-                        # Store raw EEG only - frequency bands will be extracted after preprocessing in __getitem__
-                        sample = {
-                            'eeg_raw': eeg_window,
-                            'sentence_text': sentence,
-                            'subject': subject_id,
-                            'task': f'{task_type}{task_num}_sent{i+1}'
-                        }
-                        samples.append(sample)
-            
+                    _add_window(start_idx, end_idx, sentence, i + 1)
+
+            del eeg
             return samples
             
         except Exception as e:
@@ -966,21 +1125,46 @@ class ZuCoDataset(Dataset):
         
         return bands
     
+    def _normalize_sentence_id(self, text: str) -> str:
+        """Canonical sentence key so the same stimulus cannot leak across splits."""
+        return ' '.join(str(text).strip().lower().split())
+
     def _split_data(self, all_samples: List[Dict]) -> List[Dict]:
-        """Split data into train/val/test sets"""
-        total_samples = len(all_samples)
-        
-        train_end = int(total_samples * self.train_split)
-        val_end = int(total_samples * (self.train_split + self.val_split))
-        
-        if self.split == 'train':
-            return all_samples[:train_end]
-        elif self.split == 'val':
-            return all_samples[train_end:val_end]
-        elif self.split == 'test':
-            return all_samples[val_end:]
-        else:
-            return all_samples
+        """
+        Split by unique sentence identity, not by EEG instance.
+
+        All subject recordings of the same sentence are assigned to one partition.
+        The assignment is deterministic given split_seed.
+        """
+        keys = [self._normalize_sentence_id(s.get('sentence_text', '')) for s in all_samples]
+        unique = sorted(set(keys))
+        rng = np.random.RandomState(self.split_seed)
+        rng.shuffle(unique)
+
+        n = len(unique)
+        train_end = int(n * self.train_split)
+        val_end = int(n * (self.train_split + self.val_split))
+        if n >= 3:
+            train_end = min(max(train_end, 1), n - 2)
+            val_end = min(max(val_end, train_end + 1), n - 1)
+
+        split_of = {}
+        for i, sent in enumerate(unique):
+            if i < train_end:
+                split_of[sent] = 'train'
+            elif i < val_end:
+                split_of[sent] = 'val'
+            else:
+                split_of[sent] = 'test'
+
+        selected = [sample for sample, key in zip(all_samples, keys) if split_of[key] == self.split]
+        n_sents = sum(1 for sent in unique if split_of[sent] == self.split)
+        print(
+            f"  Sentence-identity split (seed={self.split_seed}): "
+            f"{n} unique sentences → {n_sents} in '{self.split}' "
+            f"({len(selected)} EEG instances)"
+        )
+        return selected
     
     def _apply_highpass_filter(self, eeg: np.ndarray) -> np.ndarray:
         """
@@ -1188,6 +1372,16 @@ class ZuCoDataset(Dataset):
         
         # Ensure contiguous memory layout to avoid negative stride issues when converting to tensor
         return np.ascontiguousarray(eeg, dtype=np.float32)
+
+    def _segment_into_windows(self, eeg: np.ndarray) -> np.ndarray:
+        """Divide a sentence EEG array (C, T) into fixed-length windows."""
+        from utils.graph_utils import segment_into_windows
+        return segment_into_windows(
+            eeg,
+            window_size=self.window_size,
+            stride=self.window_stride,
+            max_windows=self.max_windows
+        )
     
     def __len__(self):
         return len(self.samples)
@@ -1200,7 +1394,7 @@ class ZuCoDataset(Dataset):
             # 1. High-pass filtering (0.5 Hz)
             # 2. Notch filtering (50/60 Hz)
             # 3. Z-score normalization
-            eeg_raw = sample['eeg_raw'].copy()
+            eeg_raw = self._load_sample_eeg(sample)
             
             # CRITICAL: Ensure correct format (C, T) before any processing
             # ZuCo has ~105 channels, so proper shape is (105, time_steps)
@@ -1235,7 +1429,7 @@ class ZuCoDataset(Dataset):
                 self._last_progress_idx = -1
             
             # Show progress every 5 samples or for first 10 samples
-            should_show = (idx < 10) or (idx % 5 == 0) or (idx == self._last_progress_idx + 1 and idx < 20)
+            should_show = getattr(self, '_getitem_prints', 0) < 3
             
             if should_show and idx != self._last_progress_idx:
                 import sys
@@ -1258,6 +1452,7 @@ class ZuCoDataset(Dataset):
                 print(f"  [DataLoader] Processing sample {idx+1}/{len(self.samples)} (preprocessing + frequency extraction){eta_str}...", 
                       file=sys.stderr, flush=True)
                 self._last_progress_idx = idx
+                self._getitem_prints = getattr(self, '_getitem_prints', 0) + 1
             
             # Preprocess EEG
             eeg_preprocessed = self._preprocess_eeg(eeg_raw)
@@ -1265,28 +1460,47 @@ class ZuCoDataset(Dataset):
             # Step 2: Extract frequency bands from preprocessed EEG
             # Paper: "Following artifact removal, each EEG window is decomposed into five canonical oscillatory bands"
             eeg_bands = self._extract_frequency_bands(eeg_preprocessed)
-            
-            # Convert to tensors
-            # Use .copy() to ensure contiguous memory layout and avoid negative stride errors
-            # Ensure contiguous arrays before tensor conversion (fixes negative stride error)
-            # Use .copy() first to ensure fresh memory, then ascontiguousarray for safety
+
             eeg_preprocessed_contiguous = np.ascontiguousarray(eeg_preprocessed.copy(), dtype=np.float32)
             eeg_raw_tensor = torch.from_numpy(eeg_preprocessed_contiguous)
-            
-            # Ensure all frequency bands are contiguous before tensor conversion
-            eeg_bands_tensor = {}
-            for band_name, band_eeg in eeg_bands.items():
-                # Make fresh copy and ensure contiguous (fixes negative stride issues)
-                band_eeg_contiguous = np.ascontiguousarray(band_eeg.copy(), dtype=np.float32)
-                eeg_bands_tensor[band_name] = torch.from_numpy(band_eeg_contiguous)
-            
+            eeg_bands_full = None
+            if getattr(self, 'keep_full_sentence_bands', False):
+                eeg_bands_full = {
+                    band_name: torch.from_numpy(np.ascontiguousarray(band_eeg.copy(), dtype=np.float32))
+                    for band_name, band_eeg in eeg_bands.items()
+                }
+
+            if self.window_size:
+                eeg_windows_np = self._segment_into_windows(eeg_preprocessed_contiguous)
+                eeg_bands_tensor = {}
+                for band_name, band_eeg in eeg_bands.items():
+                    band_windows = self._segment_into_windows(
+                        np.ascontiguousarray(band_eeg.copy(), dtype=np.float32)
+                    )
+                    eeg_bands_tensor[band_name] = torch.from_numpy(
+                        np.ascontiguousarray(band_windows, dtype=np.float32)
+                    )
+                eeg_windows_tensor = torch.from_numpy(np.ascontiguousarray(eeg_windows_np, dtype=np.float32))
+                num_windows = eeg_windows_tensor.shape[0]
+                window_mask = torch.ones(num_windows, dtype=torch.float32)
+            else:
+                eeg_bands_tensor = {
+                    k: torch.from_numpy(np.ascontiguousarray(band_eeg.copy(), dtype=np.float32)).unsqueeze(0)
+                    for k, band_eeg in eeg_bands.items()
+                }
+                eeg_windows_tensor = eeg_raw_tensor.unsqueeze(0)
+                window_mask = torch.ones(1, dtype=torch.float32)
+
             return {
-                'eeg_raw': eeg_raw_tensor,           # (C, T) - preprocessed
-                'eeg_bands': eeg_bands_tensor,       # Dict of (C, T) tensors - extracted from preprocessed EEG
+                'eeg_raw': eeg_raw_tensor,
+                'eeg_windows': eeg_windows_tensor,
+                'eeg_bands': eeg_bands_tensor,
+                'eeg_bands_full': eeg_bands_full,
+                'window_mask': window_mask,
                 'sentence_text': sample['sentence_text'],
                 'subject': sample['subject'],
                 'task': sample['task'],
-                'text': sample['sentence_text']      # For compatibility with existing code
+                'text': sample['sentence_text']
             }
         except Exception as e:
             import sys
@@ -1303,157 +1517,142 @@ class ZuCoDataset(Dataset):
 
 def collate_fn(batch, tokenizer=None, max_seq_length=128, max_eeg_length=20000):
     """
-    Collate function for DataLoader
-    
-    Args:
-        batch: List of samples (from __getitem__)
-        tokenizer: Text tokenizer
-        max_seq_length: Maximum sequence length for text
-        max_eeg_length: Maximum time steps for EEG (to avoid memory issues)
-                        Default: 20000 (~80 seconds at 250Hz). Set to None to use batch max.
-        
-    Returns:
-        batched_data: Dictionary of batched tensors
+    Collate function for DataLoader.
+
+    Windowed band tensors are padded along the window axis.
+    Full-sentence bands are padded along time for the static-functional ablation.
     """
-    # Extract components
     eeg_raw_list = [item['eeg_raw'] for item in batch]
     eeg_bands_list = [item['eeg_bands'] for item in batch]
     texts = [item['sentence_text'] for item in batch]
     subjects = [item['subject'] for item in batch]
     tasks = [item['task'] for item in batch]
-    
-    # EARLY VALIDATION: Check shapes before processing
-    for idx, eeg in enumerate(eeg_raw_list):
-        shape = eeg.shape
-        if len(shape) != 2:
-            import sys
-            print(f"  [ERROR] Sample {idx} has unexpected dimensions: {shape}", file=sys.stderr, flush=True)
-            raise ValueError(f"Expected 2D EEG data, got shape {shape}")
-        
-        channels, time = shape
-        if not (50 <= channels <= 200):
-            import sys
-            print(f"  [ERROR] Sample {idx} has suspicious channel count: {channels} (shape: {shape})", 
-                  file=sys.stderr, flush=True)
-            print(f"  [ERROR] This suggests the data wasn't transposed correctly in __getitem__", 
-                  file=sys.stderr, flush=True)
-    
-    # CRITICAL FIX: Always normalize to 105 channels (model's expected input)
-    # Don't use batch's most common - always use 105 to match model architecture
-    num_channels = 105  # ZuCo standard and model's expected input
-    
-    # Log channel distribution for debugging, but always use 105
-    from collections import Counter
-    channel_counts = [e.shape[0] for e in eeg_raw_list]
-    channel_counter = Counter(channel_counts)
-    
-    # Warn if batch has unusual channel counts, but still normalize to 105
-    reasonable_channel_counts = {k: v for k, v in channel_counter.items() if 50 <= k <= 200}
-    if not reasonable_channel_counts or max(reasonable_channel_counts.items(), key=lambda x: x[1])[0] != 105:
-        import sys
-        if not reasonable_channel_counts:
-            print(f"  [WARNING] No reasonable channel counts (50-200) in batch. Distribution: {dict(channel_counter.most_common(5))}", file=sys.stderr, flush=True)
-        else:
-            most_common = max(reasonable_channel_counts.items(), key=lambda x: x[1])[0]
-            if most_common != 105:
-                print(f"  [INFO] Batch has mostly {most_common} channels, but normalizing all to 105 (model expects 105)", file=sys.stderr, flush=True)
-    
-    # Filter or pad samples to match the most common channel count
-    eeg_raw_normalized = []
-    for idx, eeg in enumerate(eeg_raw_list):
-        current_channels = eeg.shape[0]
-        if current_channels < num_channels:
-            # Pad with zeros (add extra channels)
-            padding = torch.zeros(num_channels - current_channels, eeg.shape[1], dtype=eeg.dtype, device=eeg.device)
-            eeg = torch.cat([eeg, padding], dim=0)
-        elif current_channels > num_channels:
-            # Truncate to match (take first N channels)
-            eeg = eeg[:num_channels, :]
-        eeg_raw_normalized.append(eeg)
-    
-    # Limit maximum sequence length to avoid memory issues
-    max_eeg_len = max(e.shape[1] for e in eeg_raw_normalized)
-    original_max_len = max_eeg_len
+
+    first_shape = eeg_raw_list[0].shape
+    needs_transpose = first_shape[0] > first_shape[1] and 50 < first_shape[1] < 200
+    if needs_transpose:
+        eeg_raw_list = [eeg.T for eeg in eeg_raw_list]
+
+    max_eeg_len = max(e.shape[1] for e in eeg_raw_list)
     if max_eeg_length is not None and max_eeg_len > max_eeg_length:
-        # Truncate sequences that are too long to limit memory usage
-        truncated_count = sum(1 for e in eeg_raw_normalized if e.shape[1] > max_eeg_length)
-        if truncated_count > 0:
-            import sys
-            print(f"  [WARNING] Truncating {truncated_count} sequences from {original_max_len} to {max_eeg_length} time steps to avoid memory issues", 
-                  file=sys.stderr, flush=True)
-        eeg_raw_normalized = [eeg[:, :max_eeg_length] if eeg.shape[1] > max_eeg_length else eeg for eeg in eeg_raw_normalized]
+        eeg_raw_list = [
+            eeg[:, :max_eeg_length] if eeg.shape[1] > max_eeg_length else eeg
+            for eeg in eeg_raw_list
+        ]
         max_eeg_len = max_eeg_length
-    
-    # Pad time dimension to same length
+
+    num_channels = eeg_raw_list[0].shape[0]
     eeg_raw_padded = []
-    for eeg in eeg_raw_normalized:
+    for eeg in eeg_raw_list:
         if eeg.shape[1] < max_eeg_len:
-            padding = torch.zeros(num_channels, max_eeg_len - eeg.shape[1], dtype=eeg.dtype, device=eeg.device)
-            eeg = torch.cat([eeg, padding], dim=1)
+            eeg = torch.cat([eeg, torch.zeros(num_channels, max_eeg_len - eeg.shape[1])], dim=1)
         eeg_raw_padded.append(eeg)
-    
-    eeg_raw_batch = torch.stack(eeg_raw_padded)  # (batch_size, C, T)
-    
-    # Pad frequency bands (normalize channel counts first, same as raw EEG)
+    eeg_raw_batch = torch.stack(eeg_raw_padded)
+
+    def _as_windowed(band: torch.Tensor) -> torch.Tensor:
+        if band.dim() == 2:
+            if needs_transpose:
+                band = band.T
+            return band.unsqueeze(0)
+        if band.dim() == 3:
+            return band
+        raise ValueError(f"Unexpected band rank {band.dim()}")
+
+    windowed_lists = {name: [] for name in eeg_bands_list[0].keys()}
+    for sample_bands in eeg_bands_list:
+        for name, band in sample_bands.items():
+            windowed_lists[name].append(_as_windowed(band))
+
+    max_windows = max(b.shape[0] for b in next(iter(windowed_lists.values())))
+    window_len = next(iter(windowed_lists.values()))[0].shape[-1]
     eeg_bands_batch = {}
-    for band_name in eeg_bands_list[0].keys():
-        band_list = [item[band_name] for item in eeg_bands_list]
-        
-        # Normalize channel counts to match num_channels (same as raw EEG)
-        band_list_normalized = []
-        for idx, band_eeg in enumerate(band_list):
-            current_channels = band_eeg.shape[0]
-            if current_channels < num_channels:
-                # Pad with zeros (add extra channels)
-                padding = torch.zeros(num_channels - current_channels, band_eeg.shape[1], dtype=band_eeg.dtype, device=band_eeg.device)
-                band_eeg = torch.cat([band_eeg, padding], dim=0)
-            elif current_channels > num_channels:
-                # Truncate to match (take first N channels)
-                band_eeg = band_eeg[:num_channels, :]
-            band_list_normalized.append(band_eeg)
-        
-        # Truncate if needed (same max length limit)
-        if max_eeg_length is not None:
-            band_list_normalized = [band[:, :max_eeg_len] if band.shape[1] > max_eeg_len else band for band in band_list_normalized]
-        
-        # Pad time dimension
-        band_padded = []
-        for band_eeg in band_list_normalized:
-            if band_eeg.shape[1] < max_eeg_len:
-                padding = torch.zeros(num_channels, max_eeg_len - band_eeg.shape[1], dtype=band_eeg.dtype, device=band_eeg.device)
-                band_eeg = torch.cat([band_eeg, padding], dim=1)
-            band_padded.append(band_eeg)
-        eeg_bands_batch[band_name] = torch.stack(band_padded)  # (batch_size, C, T)
-    
-    # Tokenize texts
-    if tokenizer is not None:
-        tokenized = tokenizer(
-            texts,
-            padding='max_length',
-            max_length=max_seq_length,
-            truncation=True,
-            return_tensors='pt'
-        )
-        text_tokens = tokenized['input_ids']
-    else:
-        # Error: tokenizer is required for proper text encoding
-        # Paper uses standard tokenization procedures - raise error rather than using placeholder
+    for name, band_list in windowed_lists.items():
+        padded = []
+        for band in band_list:
+            W, C, T = band.shape
+            if T != window_len:
+                if T < window_len:
+                    band = torch.cat([band, torch.zeros(W, C, window_len - T)], dim=-1)
+                else:
+                    band = band[:, :, :window_len]
+            if W < max_windows:
+                band = torch.cat([band, torch.zeros(max_windows - W, C, window_len)], dim=0)
+            padded.append(band)
+        eeg_bands_batch[name] = torch.stack(padded)
+
+    window_masks = []
+    for item in batch:
+        mask = item.get('window_mask')
+        if mask is None:
+            mask = torch.ones(_as_windowed(item['eeg_bands'][next(iter(item['eeg_bands']))]).shape[0])
+        if mask.numel() < max_windows:
+            mask = torch.cat([mask.float(), torch.zeros(max_windows - mask.numel())])
+        else:
+            mask = mask.float()[:max_windows]
+        window_masks.append(mask)
+    window_mask_batch = torch.stack(window_masks)
+
+    eeg_windows_batch = None
+    if all('eeg_windows' in item for item in batch):
+        windows = [_as_windowed(item['eeg_windows']) for item in batch]
+        padded_w = []
+        for win in windows:
+            W, C, T = win.shape
+            if T != window_len:
+                win = torch.cat([win, torch.zeros(W, C, window_len - T)], dim=-1) if T < window_len else win[:, :, :window_len]
+            if W < max_windows:
+                win = torch.cat([win, torch.zeros(max_windows - W, C, window_len)], dim=0)
+            padded_w.append(win)
+        eeg_windows_batch = torch.stack(padded_w)
+
+    eeg_bands_full_batch = None
+    if all(item.get('eeg_bands_full') is not None for item in batch):
+        eeg_bands_full_batch = {}
+        for name in eeg_bands_list[0].keys():
+            full_list = [item['eeg_bands_full'][name] for item in batch]
+            if needs_transpose:
+                full_list = [
+                    band.T if band.dim() == 2 and band.shape[0] > band.shape[1] else band
+                    for band in full_list
+                ]
+            padded_full = []
+            for band in full_list:
+                if band.shape[1] > max_eeg_len:
+                    band = band[:, :max_eeg_len]
+                if band.shape[1] < max_eeg_len:
+                    band = torch.cat([band, torch.zeros(num_channels, max_eeg_len - band.shape[1])], dim=1)
+                padded_full.append(band)
+            eeg_bands_full_batch[name] = torch.stack(padded_full)
+
+    if tokenizer is None:
         raise ValueError(
             "Tokenizer is required for text tokenization. "
-            "Please provide a tokenizer (e.g., from transformers library) in collate_fn. "
-            "The paper uses standard tokenization procedures which require a proper tokenizer."
+            "Please provide a tokenizer (e.g., from transformers library) in collate_fn."
         )
-    
-    return {
-        'eeg': eeg_raw_batch,          # (batch_size, C, T) - for compatibility
-        'eeg_raw': eeg_raw_batch,      # (batch_size, C, T)
-        'eeg_bands': eeg_bands_batch,  # Dict: {band_name: (batch_size, C, T)}
-        'text': texts,                 # List of sentence strings
-        'sentence_text': texts,        # Alias for compatibility
-        'text_tokens': text_tokens,    # (batch_size, max_seq_length)
-        'subject': subjects,           # List of subject IDs
-        'task': tasks                  # List of task IDs
+    tokenized = tokenizer(
+        texts,
+        padding='max_length',
+        max_length=max_seq_length,
+        truncation=True,
+        return_tensors='pt'
+    )
+
+    batch_out = {
+        'eeg': eeg_raw_batch,
+        'eeg_raw': eeg_raw_batch,
+        'eeg_bands': eeg_bands_batch,
+        'window_mask': window_mask_batch,
+        'text': texts,
+        'sentence_text': texts,
+        'text_tokens': tokenized['input_ids'],
+        'subject': subjects,
+        'task': tasks
     }
+    if eeg_windows_batch is not None:
+        batch_out['eeg_windows'] = eeg_windows_batch
+    if eeg_bands_full_batch is not None:
+        batch_out['eeg_bands_full'] = eeg_bands_full_batch
+    return batch_out
 
 
 def load_zuco_data(data_dir: str, version: Optional[str] = None):

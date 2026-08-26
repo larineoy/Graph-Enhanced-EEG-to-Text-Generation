@@ -47,6 +47,7 @@ checkpoints/
 *.csv
 *.npy
 data/processed/
+data/.cache/
 
 # Logs
 logs/
