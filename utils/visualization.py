@@ -229,10 +229,8 @@ def visualize_learned_graphs_from_checkpoint(
     if sample_eeg_bands is not None:
         # Generate graphs from sample data
         with torch.no_grad():
-            A, node_features, bandpowers = model.strg(sample_eeg_bands)
-            
-            # Save adjacency heatmap
-            A_np = A.cpu().numpy()
+            strg_out = model.strg(sample_eeg_bands)
+            A_np = strg_out['edge_mask'][0, 0].cpu().numpy() if strg_out['edge_mask'].dim() == 4 else strg_out['edge_mask'][0].cpu().numpy()
             save_adjacency_heatmap(
                 A_np,
                 os.path.join(output_dir, 'adjacency_heatmap.png'),

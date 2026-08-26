@@ -13,7 +13,7 @@ from transformers import AutoTokenizer
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from train import load_config, create_model
+from train import load_config, create_model, dataset_kwargs_from_config, get_decoder_tokenizer, sync_model_config_from_dataset
 from preprocessing.preprocessing import ZuCoDataset, collate_fn
 from utils.visualization import save_adjacency_heatmap, visualize_strg_comprehensive
 
@@ -51,42 +51,30 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"  ✓ Using device: {device}")
     
-    # Create model
-    print("\n[2/4] Creating model...")
+    print("\n[2/4] Loading sample data...")
+    tokenizer = get_decoder_tokenizer(config)
+    print("  ✓ BART tokenizer loaded")
+    val_dataset = ZuCoDataset(
+        args.data_dir,
+        split='val',
+        **dataset_kwargs_from_config(config)
+    )
+    sync_model_config_from_dataset(config, val_dataset)
+
+    print("\n[3/4] Creating model...")
     model = create_model(config, device)
+    if getattr(val_dataset, 'electrode_positions', None) is not None:
+        model.set_electrode_positions(val_dataset.electrode_positions)
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
     model.eval()
-    
+
     if 'epoch' in checkpoint:
         print(f"  ✓ Model from epoch {checkpoint['epoch'] + 1}")
     if 'best_val_loss' in checkpoint:
         print(f"  ✓ Best validation loss: {checkpoint['best_val_loss']:.4f}")
-    
-    # Load a sample batch for visualization
-    print("\n[3/4] Loading sample data...")
-    try:
-        tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        print("  ✓ BERT tokenizer loaded")
-    except:
-        print("  ⚠ Warning: Could not load tokenizer")
-        tokenizer = None
-    
-    # Load validation dataset
+
     data_config = config['data']
-    val_dataset = ZuCoDataset(
-        args.data_dir,
-        split='val',
-        max_seq_length=data_config['max_seq_length'],
-        apply_notch_filter=data_config.get('apply_notch_filter', True),
-        notch_freq=data_config.get('notch_freq', 50.0),
-        apply_highpass_filter=data_config.get('apply_highpass_filter', True),
-        highpass_cutoff=data_config.get('highpass_cutoff', 0.5),
-        detect_bad_channels=data_config.get('detect_bad_channels', False),
-        bad_channel_threshold=data_config.get('bad_channel_threshold', 3.0)
-    )
     
     # Get max_eeg_length from config
     max_eeg_length = config['model'].get('max_eeg_length', 20000)
@@ -113,8 +101,8 @@ def main():
     try:
         # Simple adjacency heatmap
         with torch.no_grad():
-            A, node_features, bandpowers = model.strg(sample_eeg_bands)
-            A_np = A[0].cpu().numpy()
+            strg_out = model.strg(sample_eeg_bands)
+            A_np = strg_out['edge_mask'][0, 0].cpu().numpy()
             
             save_adjacency_heatmap(
                 A_np,

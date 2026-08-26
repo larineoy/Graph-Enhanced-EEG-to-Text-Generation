@@ -17,7 +17,14 @@ from typing import List, Dict
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from train import load_config, create_model, set_seed
+from train import (
+    load_config,
+    create_model,
+    set_seed,
+    dataset_kwargs_from_config,
+    get_decoder_tokenizer,
+    sync_model_config_from_dataset,
+)
 from preprocessing.preprocessing import ZuCoDataset, collate_fn
 
 
@@ -229,39 +236,29 @@ def main():
     device = torch.device(config['device'] if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Load tokenizer
-    try:
-        tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        print("✓ Tokenizer loaded")
-    except:
-        print("⚠ Warning: Could not load tokenizer")
-        tokenizer = None
-    
-    # Load model
+    tokenizer = get_decoder_tokenizer(config)
+    print("✓ BART tokenizer loaded")
+
+    print(f"\nLoading {args.split} dataset...")
+    dataset = ZuCoDataset(
+        args.data_dir,
+        split=args.split,
+        **dataset_kwargs_from_config(config)
+    )
+    sync_model_config_from_dataset(config, dataset)
+
     print(f"\nLoading model from {args.checkpoint}...")
     model = create_model(config, device)
+    if getattr(dataset, 'electrode_positions', None) is not None:
+        model.set_electrode_positions(dataset.electrode_positions)
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
     model.eval()
     print("✓ Model loaded")
-    
-    # Load dataset
-    print(f"\nLoading {args.split} dataset...")
+
     data_config = config['data']
     max_eeg_length = config['model'].get('max_eeg_length', 20000)
-    
-    dataset = ZuCoDataset(
-        args.data_dir,
-        split=args.split,
-        max_seq_length=data_config['max_seq_length'],
-        apply_notch_filter=data_config.get('apply_notch_filter', True),
-        notch_freq=data_config.get('notch_freq', 50.0),
-        apply_highpass_filter=data_config.get('apply_highpass_filter', True),
-        highpass_cutoff=data_config.get('highpass_cutoff', 0.5)
-    )
     
     dataloader = DataLoader(
         dataset,

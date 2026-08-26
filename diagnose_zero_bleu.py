@@ -8,10 +8,17 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__))
 
-from train import load_config, create_model, set_seed
+from train import (
+    load_config,
+    create_model,
+    set_seed,
+    dataset_kwargs_from_config,
+    get_decoder_tokenizer,
+    move_eeg_batch,
+    sync_model_config_from_dataset,
+)
 from preprocessing.preprocessing import ZuCoDataset, collate_fn
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
 import random
 
 
@@ -62,17 +69,16 @@ def diagnose_validation(model, dataloader, tokenizer, device, config, num_sample
             batch = collate_fn([sample], tokenizer, config['data']['max_seq_length'], 
                              max_eeg_length=config['model'].get('max_eeg_length', 20000))
             
-            eeg_bands = {k: v.to(device) for k, v in batch['eeg_bands'].items()}
+            eeg_bands, window_mask, eeg_bands_full, eeg_windows = move_eeg_batch(batch, device)
             texts = batch['text']
             text_tokens = batch['text_tokens'].to(device)
             
-            # Generate
             generated = model.generate(
                 eeg_bands,
-                bos_token_id=bos_token_id,
-                eos_token_id=eos_token_id,
-                pad_token_id=pad_token_id,
-                max_length=config['model']['decoder']['max_decoder_length']
+                max_length=config['model']['decoder']['max_decoder_length'],
+                window_mask=window_mask,
+                eeg_bands_full=eeg_bands_full,
+                eeg_windows=eeg_windows
             )
             
             # Decode
@@ -282,10 +288,8 @@ if __name__ == '__main__':
     
     # Load tokenizer
     print("\n[STAGE 1/4] Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    print("  ✓ Tokenizer loaded")
+    tokenizer = get_decoder_tokenizer(config)
+    print("  ✓ BART tokenizer loaded")
     
     # Load dataset first to detect actual number of channels
     print("\n[STAGE 2/4] Loading dataset to detect channels...")
@@ -295,12 +299,9 @@ if __name__ == '__main__':
     dataset = ZuCoDataset(
         args.data_dir,
         split=args.split,
-        max_seq_length=data_config['max_seq_length'],
-        apply_notch_filter=data_config.get('apply_notch_filter', True),
-        notch_freq=data_config.get('notch_freq', 50.0),
-        apply_highpass_filter=data_config.get('apply_highpass_filter', True),
-        highpass_cutoff=data_config.get('highpass_cutoff', 0.5)
+        **dataset_kwargs_from_config(config)
     )
+    sync_model_config_from_dataset(config, dataset)
     
     # Update config with actual number of channels from dataset
     if hasattr(dataset, 'num_channels') and dataset.num_channels is not None:
@@ -325,6 +326,8 @@ if __name__ == '__main__':
     # Load model
     print("\n[STAGE 3/4] Creating model...")
     model = create_model(config, device)
+    if getattr(dataset, 'electrode_positions', None) is not None:
+        model.set_electrode_positions(dataset.electrode_positions)
     
     if os.path.exists(args.checkpoint):
         print(f"[STAGE 4/4] Loading checkpoint: {args.checkpoint}")
